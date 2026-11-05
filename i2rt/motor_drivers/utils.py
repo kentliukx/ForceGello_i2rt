@@ -48,9 +48,9 @@ class MotorInfo:
 
     Attributes:
         id (int): Motor ID.
-        target_torque (int): Target torque value.
+        target_torque (float): Target torque value in Nm.
         vel (float): Motor speed.
-        eff (float): Motor current.
+        eff (float): Decoded motor output torque in Nm.
         pos (float): Encoder value.
         voltage (float): Motor voltage.
         temperature (float): Motor temperature.
@@ -59,7 +59,7 @@ class MotorInfo:
 
     id: int
     error_code: int
-    target_torque: int = 0
+    target_torque: float = 0.0
     vel: float = 0.0
     eff: float = 0
     pos: float = 0
@@ -67,6 +67,9 @@ class MotorInfo:
     temp_mos: float = -1
     temp_rotor: float = -1
     timestamp: float = 0.0
+    rx_monotonic_ns: int = 0
+    state_update_seq: int = 0
+    pd_torque_est: float = 0.0
 
 
 @dataclass
@@ -79,6 +82,9 @@ class FeedbackFrameInfo:
     torque: float
     temperature_mos: float
     temperature_rotor: float
+    rx_monotonic_ns: int = 0
+    tx_monotonic_ns: int = 0
+    pd_torque_est: float = 0.0
 
 
 @dataclass

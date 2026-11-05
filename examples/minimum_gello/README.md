@@ -35,7 +35,8 @@ Run the leader on another:
 
 ```bash
 python examples/minimum_gello/minimum_gello.py \
-    --gripper yam_teaching_handle --mode leader --can-channel can1 --bilateral-kp 0.2
+    --gripper yam_teaching_handle --mode leader --can-channel can1 \
+    --feedback-mode angle --bilateral-kp 0.2 --bilateral-alpha 1.0 --bilateral-beta 1.0
 ```
 
 Press **button 0** on the teaching handle to synchronize. Press again to desync.
@@ -53,7 +54,12 @@ Press **button 0** on the teaching handle to synchronize. Press again to desync.
 | `--can-channel` | `can0` | CAN interface name |
 | `--server-host` | `localhost` | Portal server host (for leader/remote visualizer) |
 | `--server-port` | `11333` | Portal server port |
-| `--bilateral-kp` | `0.0` | Bilateral force feedback gain (leader mode) |
+| `--feedback-mode` | `angle` | `angle` tracks follower joint angles; `torque` reflects follower motor torque minus modeled gravity (leader mode) |
+| `--bilateral-kp` | `0.0` | Any finite non-negative feedback gain (leader mode); leader torque caps still apply |
+| `--bilateral-alpha` | `1.0` | Non-negative speed attenuation coefficient in s/rad; per-joint gain is `bilateral_kp / (1 + bilateral_alpha * abs(follower_joint_velocity))` |
+| `--bilateral-beta` | `1.0` | Non-negative angle correction coefficient in 1/rad; multiplies feedback by `(2/pi) * atan(bilateral_beta * abs(leader_angle - follower_angle))`; zero disables feedback |
+| `--trace-latency` | `False` | Tag one in ten leader commands and write per-joint CAN receive-to-send timestamps to `/tmp/i2rt_can_latency_<channel>_<pid>.csv` on the follower; use on one host |
+| `--record-j3` | `False` | In leader mode, save J3 angles, follower PD torque estimate, and leader extra feedback torque to CSV and render a standalone SVG after shutdown |
 | `--ee-mass` | XML default | Override link_6 mass (kg) for gravity compensation with different handles |
 
 ## Overriding Handle Weight

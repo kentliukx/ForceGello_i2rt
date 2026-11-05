@@ -3,6 +3,7 @@ import os
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple
 
@@ -293,6 +294,8 @@ class DMSingleMotorCanInterface(CanInterface):
 
         # Parse the received message to extract motor information
         motor_info = self.parse_recv_message(message, motor_type)
+        motor_info.rx_monotonic_ns = getattr(self, "_last_rx_monotonic_ns", 0)
+        motor_info.tx_monotonic_ns = getattr(self, "_last_tx_monotonic_ns", 0)
         return motor_info
 
     def parse_recv_message(
@@ -358,6 +361,7 @@ class MotorCmd:
     torque: float = 0.0
     kp: float = 0.0
     kd: float = 0.0
+    trace: Optional[Dict[str, Any]] = None
 
 
 class MotorChain(Protocol):
@@ -466,6 +470,10 @@ class DMChainCanInterface(MotorChain):
 
         self.state = None
         self.state_lock = threading.Lock()
+        self._state_update_seq = 0
+        self._latency_records: deque[Dict[str, int]] = deque(maxlen=20000)
+        self._latency_lock = threading.Lock()
+        self._last_logged_trace_id = [-1] * len(motor_list)
         self._report_interval = report_interval
         self._rate_recorder = RateRecorder(name=self, report_interval=report_interval)
 
@@ -493,6 +501,7 @@ class DMChainCanInterface(MotorChain):
         self.command_lock = threading.RLock()
 
         self.start_thread_flag = False
+        self._control_thread: Optional[threading.Thread] = None
         if start_thread:
             self.start_thread()
 
@@ -555,14 +564,15 @@ class DMChainCanInterface(MotorChain):
             motor_feedback.append(self.motor_interface.motor_on(motor_id, motor_type))
         self._update_absolute_positions(motor_feedback)
         self.state = motor_feedback
+        self._state_update_seq += 1
         self.running = True
 
     def start_thread(self) -> None:
         if self.start_thread_flag:
             return
         logging.info("starting separate thread for control loop")
-        thread = threading.Thread(target=self._set_torques_and_update_state)
-        thread.start()
+        self._control_thread = threading.Thread(target=self._set_torques_and_update_state)
+        self._control_thread.start()
         self.start_thread_flag = True
         time.sleep(0.1)
         while self.state is None:
@@ -634,6 +644,7 @@ class DMChainCanInterface(MotorChain):
                     with self.state_lock:
                         self.state = motor_feedback
                         self._update_absolute_positions(motor_feedback)
+                        self._state_update_seq += 1
                     if self.same_bus_device_driver is not None:
                         time.sleep(0.001)
                         with self.same_bus_device_lock:
@@ -684,6 +695,7 @@ class DMChainCanInterface(MotorChain):
                         with self.state_lock:
                             self.state = motor_feedback
                             self._update_absolute_positions(motor_feedback)
+                            self._state_update_seq += 1
                         return True
             except RuntimeError:
                 continue
@@ -714,6 +726,22 @@ class DMChainCanInterface(MotorChain):
                 logging.error(f"{idx}th motor at DMChainCanInterface {self} failed with info {motor_info}")
                 raise e
 
+            # The firmware does not report its PD contribution separately. Estimate it
+            # from the exact gains/setpoint sent in this CAN transaction and its reply.
+            if self.motor_interface.control_mode == ControlMode.MIT:
+                fd_back.pd_torque_est = kp * (pos - fd_back.position) + kd * (vel - fd_back.velocity)
+
+            trace = commands[idx].trace
+            if trace is not None:
+                trace_id = int(trace["trace_id"])
+                rx_ns = int(trace["leader_can_rx_ns"][idx]) if idx < len(trace["leader_can_rx_ns"]) else 0
+                tx_ns = fd_back.tx_monotonic_ns
+                if rx_ns > 0 and tx_ns >= rx_ns and trace_id != self._last_logged_trace_id[idx]:
+                    self._last_logged_trace_id[idx] = trace_id
+                    record = {key: int(value) for key, value in trace.items() if key != "leader_can_rx_ns"}
+                    record.update(joint=idx + 1, leader_can_rx_ns=rx_ns, follower_can_tx_ns=tx_ns)
+                    with self._latency_lock:
+                        self._latency_records.append(record)
             motor_feedback.append(fd_back)
         return motor_feedback
 
@@ -734,6 +762,9 @@ class DMChainCanInterface(MotorChain):
                         temp_rotor=state.temperature_rotor,
                         temp_mos=state.temperature_mos,
                         timestamp=timestamp,
+                        rx_monotonic_ns=getattr(state, "rx_monotonic_ns", 0),
+                        state_update_seq=self._state_update_seq,
+                        pd_torque_est=state.pd_torque_est * self.motor_direction[idx],
                     )
                 )
         return motor_infos
@@ -754,7 +785,10 @@ class DMChainCanInterface(MotorChain):
         kp: Optional[np.ndarray] = None,
         kd: Optional[np.ndarray] = None,
         get_state: bool = True,
+        trace: Optional[Dict[str, Any]] = None,
     ) -> List[MotorInfo]:
+        if trace is not None:
+            trace = dict(trace, driver_accept_ns=time.monotonic_ns())
         command = []
         for idx in range(len(self.motor_list)):
             command.append(
@@ -764,6 +798,7 @@ class DMChainCanInterface(MotorChain):
                     vel=vel[idx] if vel is not None else 0.0,
                     kp=kp[idx] if kp is not None else 0.0,
                     kd=kd[idx] if kd is not None else 0.0,
+                    trace=trace,
                 )
             )
         with self.command_lock:
@@ -771,12 +806,24 @@ class DMChainCanInterface(MotorChain):
         if get_state:
             return self.read_states(torques=torques)
 
+    def drain_latency_records(self) -> List[Dict[str, int]]:
+        """Return and clear bounded CAN-to-CAN trace records."""
+        with self._latency_lock:
+            records = list(self._latency_records)
+            self._latency_records.clear()
+        return records
+
     def get_same_bus_device_states(self) -> Any:
         with self.same_bus_device_lock:
             return self.same_bus_device_states
 
     def close(self) -> None:
         self.running = False
+        thread = self._control_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                logging.warning("CAN control thread did not stop before socket shutdown on %s", self.channel)
         self.motor_interface.close()
 
 

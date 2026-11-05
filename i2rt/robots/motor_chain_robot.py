@@ -29,6 +29,9 @@ class JointStates:
     temp_mos: np.ndarray  # MOS temperature (float): Motor MOS temperature.
     temp_rotor: np.ndarray  # ROTOR temperature (float): Motor ROTOR temperature.
     timestamp: float
+    can_rx_monotonic_ns: np.ndarray
+    pd_torque_est: np.ndarray
+    state_update_seq: int = 0
 
     def asdict(self) -> Dict[str, Any]:
         return {
@@ -49,6 +52,7 @@ class JointCommands:
     kd: np.ndarray
 
     indices: Optional[List[int]] = None
+    trace: Optional[Dict[str, Any]] = None
 
     @classmethod
     def init_all_zero(cls, n_joints: int) -> "JointCommands":
@@ -230,6 +234,8 @@ class MotorChainRobot(Robot):
 
         self._command_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._state_condition = threading.Condition(self._state_lock)
+        self._joint_state_generation = 0
         self._mcap_lock = threading.Lock()
         self._mcap_recorder: Optional[RobotMcapRecorder] = None
         self._joint_state: Optional[JointStates] = None
@@ -238,6 +244,7 @@ class MotorChainRobot(Robot):
             time.sleep(0.05)
             self._joint_state = self._motor_state_to_joint_state(self.motor_chain.read_states())
         self._commands = JointCommands.init_all_zero(len(motor_chain))
+        self._torque_command_deadline: Optional[float] = None
         if zero_gravity_mode:
             self._commands.kd = self._grav_comp_kd.copy()
         # For SWE-454, check if the current qpos is in the joint limits
@@ -356,8 +363,7 @@ class MotorChainRobot(Robot):
 
         Send Torques and update the joint state.
         """
-        with self._command_lock:
-            joint_commands = copy.deepcopy(self._commands)
+        joint_commands = self._snapshot_joint_commands()
         with self._state_lock:
             g = self._compute_gravity_compensation(self._joint_state)
             friction_comp = (
@@ -395,6 +401,14 @@ class MotorChainRobot(Robot):
                 self._last_gripper_command_qpos = joint_commands.pos[self._gripper_index]
             self._update_joint_state(motor_torques, joint_commands)
 
+    def _snapshot_joint_commands(self) -> JointCommands:
+        with self._command_lock:
+            if self._torque_command_deadline is not None and time.monotonic() > self._torque_command_deadline:
+                self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+                self._commands.kd = self._grav_comp_kd.copy()
+                self._torque_command_deadline = None
+            return copy.deepcopy(self._commands)
+
     def _update_joint_state(
         self,
         motor_torques: np.ndarray,
@@ -414,13 +428,16 @@ class MotorChainRobot(Robot):
         else:
             has_gripper_encoder = False
 
-        motor_state = self.motor_chain.set_commands(
-            motor_torques,
-            pos=joint_commands.pos,
-            vel=joint_commands.vel,
-            kp=joint_commands.kp,
-            kd=joint_commands.kd,
-        )
+        command_kwargs: Dict[str, Any] = {
+            "pos": joint_commands.pos,
+            "vel": joint_commands.vel,
+            "kp": joint_commands.kp,
+            "kd": joint_commands.kd,
+        }
+        if joint_commands.trace is not None:
+            command_kwargs["trace"] = dict(joint_commands.trace, robot_update_ns=time.monotonic_ns())
+        motor_state = self.motor_chain.set_commands(motor_torques, **command_kwargs)
+        previous_state_update_seq = self._joint_state.state_update_seq
         self._joint_state = self._motor_state_to_joint_state(motor_state)
 
         with self._mcap_lock:
@@ -441,6 +458,9 @@ class MotorChainRobot(Robot):
 
         # For SWE-454: keep monitoring qpos during runtime
         self._check_current_qpos_in_joint_limits()
+        if self._joint_state.state_update_seq == 0 or self._joint_state.state_update_seq != previous_state_update_seq:
+            self._joint_state_generation += 1
+            self._state_condition.notify_all()
 
         if self._joint_state_saver is not None:
             assert not (has_gripper_encoder and self._gripper_index is not None), (
@@ -494,6 +514,8 @@ class MotorChainRobot(Robot):
         temp_mos = np.array([motor.temp_mos for motor in motor_state])
         temp_rotor = np.array([motor.temp_rotor for motor in motor_state])
         timestamp = motor_state[0].timestamp
+        can_rx_monotonic_ns = np.array([motor.rx_monotonic_ns for motor in motor_state], dtype=np.int64)
+        pd_torque_est = np.array([motor.pd_torque_est for motor in motor_state])
         return JointStates(
             names=names,
             pos=pos,
@@ -502,6 +524,9 @@ class MotorChainRobot(Robot):
             temp_mos=temp_mos,
             temp_rotor=temp_rotor,
             timestamp=timestamp,
+            can_rx_monotonic_ns=can_rx_monotonic_ns,
+            state_update_seq=motor_state[0].state_update_seq,
+            pd_torque_est=pd_torque_est,
         )
 
     def _compute_gravity_compensation(self, joint_state: Optional[Dict[str, np.ndarray]]) -> np.ndarray:
@@ -515,10 +540,8 @@ class MotorChainRobot(Robot):
                 print([f"{s:.2f}" for s in t])
                 raise RuntimeError(f"{self}: too large torques")
             if self._gripper_index is None:
-                return self.kdl.compute_inverse_dynamics(q, np.zeros(q.shape), np.zeros(q.shape))
-            else:
-                t = self.kdl.compute_inverse_dynamics(q, np.zeros(q.shape), np.zeros(q.shape))
-                return np.append(t, 0.0)
+                return t
+            return np.append(t, 0.0)
 
     # ----------------- Server Functions ----------------- #
 
@@ -534,6 +557,18 @@ class MotorChainRobot(Robot):
         """Return the last computed motor torques (gravity comp + any command torques)."""
         return self._last_motor_torques
 
+    def get_force_feedback_observations(self) -> Dict[str, np.ndarray]:
+        """Read measured effort and the gravity torque applied at the same joint state."""
+        with self._state_lock:
+            state = self._joint_state
+            gravity_eff = self._compute_gravity_compensation(state) * self.gravity_comp_factor
+            return {
+                "joint_pos": state.pos.copy(),
+                "joint_vel": state.vel.copy(),
+                "joint_eff_external": (state.eff - gravity_eff).copy(),
+                "joint_eff_pd_est": state.pd_torque_est.copy(),
+            }
+
     def get_joint_pos(self) -> np.ndarray:
         """Get the current state of the leader robot, including the gripper in radian.
 
@@ -542,6 +577,23 @@ class MotorChainRobot(Robot):
         """
         with self._state_lock:
             return self._joint_state.pos
+
+    def get_joint_pos_and_can_rx_ns(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Snapshot arm positions and their underlying CAN receive times together."""
+        with self._state_lock:
+            return self._joint_state.pos.copy(), self._joint_state.can_rx_monotonic_ns.copy()
+
+    def wait_for_joint_pos_and_can_rx_ns(
+        self, last_generation: int, timeout_s: float
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
+        """Return a new joint-state snapshot, or None when no update arrives in time."""
+        with self._state_condition:
+            if not self._state_condition.wait_for(
+                lambda: self._joint_state_generation != last_generation, timeout=timeout_s
+            ):
+                return None
+            state = self._joint_state
+            return state.pos.copy(), state.can_rx_monotonic_ns.copy(), self._joint_state_generation
 
     def _clip_robot_joint_pos_command(self, pos: np.ndarray) -> np.ndarray:
         """Clip the robot joint pos command to the joint limits. Do not clip the gripper pos.
@@ -562,7 +614,7 @@ class MotorChainRobot(Robot):
                 pos = np.clip(pos, self._joint_limits[:, 0], self._joint_limits[:, 1])
         return pos
 
-    def command_joint_pos(self, joint_pos: np.ndarray) -> None:
+    def command_joint_pos(self, joint_pos: np.ndarray, trace: Optional[Dict[str, Any]] = None) -> None:
         """Command the leader robot to a given state.
 
         Args:
@@ -571,9 +623,22 @@ class MotorChainRobot(Robot):
         pos = self._clip_robot_joint_pos_command(joint_pos)
         with self._command_lock:
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+            self._torque_command_deadline = None
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             self._commands.kp = self._kp
             self._commands.kd = self._kd
+            self._commands.trace = trace
+
+    def command_joint_torques(self, torques: np.ndarray) -> None:
+        """Apply joint torque feedforward; expire it after 100 ms without a new command."""
+        torques = np.asarray(torques, dtype=float)
+        if torques.shape != (len(self.motor_chain),) or not np.all(np.isfinite(torques)):
+            raise ValueError("torques must be a finite value for each joint")
+        with self._command_lock:
+            self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+            self._commands.torques = torques.copy()
+            self._commands.kd = self._grav_comp_kd.copy()
+            self._torque_command_deadline = time.monotonic() + 0.1
 
     def command_joint_state(self, joint_state: Dict[str, np.ndarray]) -> None:
         """Command the leader robot to a given state.
@@ -583,14 +648,15 @@ class MotorChainRobot(Robot):
         """
         pos = self._clip_robot_joint_pos_command(joint_state["pos"])
         vel = joint_state["vel"]
-        self._commands = JointCommands.init_all_zero(len(self.motor_chain))
         kp = joint_state.get("kp", self._kp)
         kd = joint_state.get("kd", self._kd)
         with self._command_lock:
+            self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             self._commands.vel = self.remapper.to_robot_joint_vel_space(vel)
             self._commands.kp = kp
             self._commands.kd = kd
+            self._torque_command_deadline = None
 
     def zero_torque_mode(self) -> None:
         logging.info(f"Entering zero_torque_mode for {self}")
@@ -598,6 +664,7 @@ class MotorChainRobot(Robot):
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._kp = np.zeros(len(self.motor_chain))
             self._kd = np.zeros(len(self.motor_chain))
+            self._torque_command_deadline = None
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         """Get the current observations of the robot.
@@ -675,6 +742,7 @@ class MotorChainRobot(Robot):
         with self._command_lock:
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.kd = self._grav_comp_kd.copy()
+            self._torque_command_deadline = None
 
     def start_recording(self, save_dir: str) -> bool:
         """Start recording joint state data asynchronously."""

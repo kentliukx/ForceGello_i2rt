@@ -1,9 +1,15 @@
+import csv
 import logging
+import math
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from functools import partial, wraps
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import mujoco
@@ -24,9 +30,61 @@ _MAX_DOFS = 16
 slice is exposed through an int Value the worker fills after constructing the robot."""
 
 _WORKER_LOOP_PERIOD_S = 0.002
-"""~500 Hz pacing for worker loops whose reads hit cached state (get_joint_pos /
-get_info return instantly). Without it these loops peg a CPU core; the actual YAM
-hardware/control thread updates at ~250 Hz, well below this cap, so no data is lost."""
+"""Maximum follower command-queue wait and viewer-only polling interval.
+The leader control worker waits for fresh CAN-backed joint state instead."""
+
+_LEADER_IO_PERIOD_S = 0.002
+"""Check the latest leader command and follower feedback about every 2 ms."""
+
+_FEEDBACK_TIMEOUT_S = 0.2
+_MAX_FEEDBACK_TORQUES_NM = np.array([10.0, 10.0, 10.0, 5.0, 5.0, 5.0])
+_FOLLOWER_COMMAND_TIMEOUT_S = 0.5
+_LATENCY_TRACE_EVERY = 10
+_LATENCY_REPORT_PERIOD_S = 5.0
+_LATENCY_FIELDS = (
+    "trace_id",
+    "joint",
+    "leader_can_rx_ns",
+    "leader_read_ns",
+    "leader_queue_ns",
+    "leader_io_ns",
+    "follower_rpc_ns",
+    "follower_worker_ns",
+    "robot_update_ns",
+    "driver_accept_ns",
+    "follower_can_tx_ns",
+)
+
+
+def _feedback_source(
+    mode: Literal["angle", "torque"],
+    leader_pos: np.ndarray,
+    follower_pos: np.ndarray,
+    follower_eff: np.ndarray,
+    leader_kp: np.ndarray,
+) -> np.ndarray:
+    """Return the torque-like signal to reflect from one of the two feedback modes."""
+    if mode == "angle":
+        return leader_kp * (leader_pos - follower_pos)
+    if mode == "torque":
+        return follower_eff
+    raise ValueError(f"unsupported feedback mode: {mode}")
+
+
+def _leader_feedback_torque(
+    feedback_signal: np.ndarray,
+    follower_vel: np.ndarray,
+    angle_error: np.ndarray,
+    bilateral_kp: float,
+    bilateral_alpha: float,
+    bilateral_beta: float,
+) -> np.ndarray:
+    """Apply speed attenuation, angle-error correction, and torque caps."""
+    with np.errstate(over="ignore"):
+        speed_attenuation = 1.0 + bilateral_alpha * np.abs(follower_vel)
+        angle_correction = (2.0 / np.pi) * np.arctan(bilateral_beta * np.abs(angle_error))
+        reflected_eff = -bilateral_kp * (feedback_signal * angle_correction / speed_attenuation)
+    return np.clip(reflected_eff, -_MAX_FEEDBACK_TORQUES_NM, _MAX_FEEDBACK_TORQUES_NM)
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +107,7 @@ class ClientRobot(Robot):
     def command_joint_pos(self, joint_pos: np.ndarray) -> None:
         self._client.command_joint_pos(joint_pos)
 
-    def command_joint_state(self, joint_state: Dict[str, np.ndarray]) -> None:
+    def command_joint_state(self, joint_state: Dict[str, Any]) -> None:
         self._client.command_joint_state(joint_state)
 
     def get_observations(self) -> Dict[str, np.ndarray]:
@@ -71,22 +129,41 @@ class YAMLeaderRobot:
         self._robot = robot
         self._motor_chain = robot.motor_chain
 
-    def get_info(self) -> Tuple[np.ndarray, np.ndarray]:
-        qpos = self._robot.get_observations()["joint_pos"]
+    def get_info(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        qpos, can_rx_ns = self._robot.get_joint_pos_and_can_rx_ns()
+        read_ns = time.monotonic_ns()
+        return self._format_info(qpos, can_rx_ns, read_ns)
+
+    def wait_for_info(
+        self, last_generation: int, timeout_s: float
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]:
+        """Wait for a new arm state before issuing another follower target."""
+        snapshot = self._robot.wait_for_joint_pos_and_can_rx_ns(last_generation, timeout_s)
+        if snapshot is None:
+            return None
+        qpos, can_rx_ns, generation = snapshot
+        return (*self._format_info(qpos, can_rx_ns, time.monotonic_ns()), generation)
+
+    def _format_info(
+        self, qpos: np.ndarray, can_rx_ns: np.ndarray, read_ns: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         encoder_obs = self._motor_chain.get_same_bus_device_states()
         if encoder_obs is None:
             # Populated only after the first CAN read in the background driver thread.
             raise RuntimeError("CAN device states not ready yet")
         gripper_cmd = 1 - encoder_obs[0].position
         qpos_with_gripper = np.concatenate([qpos, [gripper_cmd]])
-        return qpos_with_gripper, encoder_obs[0].io_inputs
+        return qpos_with_gripper, encoder_obs[0].io_inputs, can_rx_ns, read_ns
 
     def command_joint_pos(self, joint_pos: np.ndarray) -> None:
         assert joint_pos.shape[0] == 6
         self._robot.command_joint_pos(joint_pos)
 
-    def update_kp_kd(self, kp: np.ndarray, kd: np.ndarray) -> None:
-        self._robot.update_kp_kd(kp, kd)
+    def command_joint_torques(self, torques: np.ndarray) -> None:
+        self._robot.command_joint_torques(torques)
+
+    def enter_gravity_comp_idle(self) -> None:
+        self._robot.enter_gravity_comp_idle()
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +182,11 @@ class Args:
     server_port: int = DEFAULT_ROBOT_PORT
     can_channel: str = "can0"
     bilateral_kp: float = 0.0
+    bilateral_alpha: float = 1.0
+    bilateral_beta: float = 1.0
+    feedback_mode: Literal["angle", "torque"] = "angle"
+    trace_latency: bool = False
+    record_j3: bool = False
     sim: bool = False
     """Use SimRobot instead of real hardware."""
     ee_mass: Optional[float] = None
@@ -121,6 +203,10 @@ class Resources:
 
     processes: List[portal.Process] = field(default_factory=list)
     pos_shared: Optional[portal.SharedArray] = None
+    vel_shared: Optional[portal.SharedArray] = None
+    feedback_shared: Optional[portal.SharedArray] = None
+    pid_shared: Optional[portal.SharedArray] = None
+    feedback_time: Optional[Any] = None
     stop_event: Optional[Any] = None
 
 
@@ -129,6 +215,28 @@ def _spawn_into(processes: List[portal.Process], proc: portal.Process) -> portal
     proc.start()
     processes.append(proc)
     return proc
+
+
+def _log_latency_summary(records: List[Dict[str, int]], channel: str) -> None:
+    """Summarize traced samples; raw stage timestamps remain in the CSV."""
+    for joint in sorted({record["joint"] for record in records}):
+        totals_ms = np.array(
+            [
+                (record["follower_can_tx_ns"] - record["leader_can_rx_ns"]) / 1e6
+                for record in records
+                if record["joint"] == joint
+            ]
+        )
+        p50, p95 = np.percentile(totals_ms, [50, 95])
+        logging.info(
+            "[CAN latency %s joint%d] n=%d CAN RX to TX p50=%.2f ms p95=%.2f ms max=%.2f ms",
+            channel,
+            joint,
+            len(totals_ms),
+            p50,
+            p95,
+            np.max(totals_ms),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +249,10 @@ def _spawn_into(processes: List[portal.Process], proc: portal.Process) -> portal
 def _yam_polling_worker(
     args: "Args",
     pos_shared: "portal.SharedArray",
+    vel_shared: Optional["portal.SharedArray"],
+    feedback_shared: Optional["portal.SharedArray"],
+    pid_shared: Optional["portal.SharedArray"],
+    feedback_time: Any,
     n_dofs_value: Any,
     cmd_queue: Any,
     stop_event: Any,
@@ -159,31 +271,97 @@ def _yam_polling_worker(
         ee_mass=args.ee_mass,
         sim=args.sim,
     )
+    if args.trace_latency and isinstance(yam, MotorChainRobot):
+        yam.motor_chain.motor_interface.trace_timestamps_enabled = True
     n_dofs_value.value = yam.num_dofs()
     rate = RateRecorder(name=rate_name, report_interval=1.0)
     rate.start()
+    last_command_time = 0.0
+    following = False
+    latency_file = None
+    latency_writer = None
+    if args.trace_latency and cmd_queue is not None and isinstance(yam, MotorChainRobot):
+        latency_path = Path("/tmp") / f"i2rt_can_latency_{args.can_channel}_{os.getpid()}.csv"
+        latency_file = latency_path.open("w", newline="")
+        latency_writer = csv.DictWriter(latency_file, fieldnames=_LATENCY_FIELDS)
+        latency_writer.writeheader()
+        logging.info("CAN latency trace: %s", latency_path)
+    next_latency_report = time.monotonic() + _LATENCY_REPORT_PERIOD_S
     while not stop_event.is_set():
         if cmd_queue is not None:
-            # Drain to the newest command and drop any stale backlog. Commands arrive (over RPC)
-            # at least as fast as this loop actuates them, so replaying every queued command in
-            # FIFO order would make the follower lag further and further behind. Mirrors the
-            # leader io loop's drain-to-newest (_run_leader_io_loop).
-            cmd = None
+            # The queue wakes this worker as soon as a command arrives. A short timeout
+            # still lets us publish feedback and check command/stop deadlines regularly.
+            try:
+                cmd = cmd_queue.get(timeout=_WORKER_LOOP_PERIOD_S)
+            except queue.Empty:
+                cmd = None
+            # Commands are latest-wins: discard any backlog accumulated during the
+            # previous hardware/feedback update.
             while True:
                 try:
                     cmd = cmd_queue.get_nowait()
                 except queue.Empty:
                     break
             if cmd is not None:
-                yam.command_joint_pos(cmd)
+                if isinstance(cmd, dict):
+                    trace = dict(cmd["trace"], follower_worker_ns=time.monotonic_ns())
+                    if isinstance(yam, MotorChainRobot):
+                        yam.command_joint_pos(np.asarray(cmd["pos"]), trace=trace)
+                    else:
+                        yam.command_joint_pos(np.asarray(cmd["pos"]))
+                else:
+                    yam.command_joint_pos(cmd)
+                last_command_time = time.monotonic()
+                following = True
+            elif following and time.monotonic() - last_command_time > _FOLLOWER_COMMAND_TIMEOUT_S:
+                if isinstance(yam, MotorChainRobot):
+                    yam.enter_gravity_comp_idle()
+                following = False
         try:
-            pos = yam.get_joint_pos()
+            if feedback_shared is not None:
+                if isinstance(yam, MotorChainRobot):
+                    feedback_obs = yam.get_force_feedback_observations()
+                    pos = feedback_obs["joint_pos"]
+                    vel = feedback_obs["joint_vel"]
+                    external_eff = feedback_obs["joint_eff_external"]
+                    pd_eff = feedback_obs["joint_eff_pd_est"]
+                else:
+                    obs = yam.get_observations()
+                    pos = yam.get_joint_pos()
+                    vel = obs["joint_vel"]
+                    external_eff = obs["joint_eff"] - yam.get_motor_torques()
+                    pd_eff = np.zeros_like(external_eff)
+                feedback_shared.array[: len(external_eff)] = external_eff
+                if pid_shared is not None:
+                    pid_shared.array[: len(pd_eff)] = pd_eff
+                vel_shared.array[: len(vel)] = vel
+            else:
+                pos = yam.get_joint_pos()
             pos_shared.array[: len(pos)] = pos
+            if feedback_shared is not None:
+                feedback_time.value = time.monotonic()
             rate.track()
         except Exception as e:
             logging.error(f"[{rate_name}] error: {e}")
             time.sleep(0.1)
-        time.sleep(_WORKER_LOOP_PERIOD_S)  # pace: get_joint_pos is a cached read, so this loop would otherwise spin
+        if latency_writer is not None and time.monotonic() >= next_latency_report:
+            records = yam.motor_chain.drain_latency_records()
+            if records:
+                latency_writer.writerows(records)
+                latency_file.flush()
+                _log_latency_summary(records, args.can_channel)
+            next_latency_report = time.monotonic() + _LATENCY_REPORT_PERIOD_S
+        if cmd_queue is None:
+            time.sleep(_WORKER_LOOP_PERIOD_S)  # viewer-only worker has no command queue to wait on
+
+    if latency_writer is not None:
+        records = yam.motor_chain.drain_latency_records()
+        latency_writer.writerows(records)
+        latency_file.close()
+    if isinstance(yam, MotorChainRobot):
+        yam.enter_gravity_comp_idle()
+        time.sleep(0.05)
+        yam.close()
 
 
 def _rpc_polling_worker(
@@ -212,12 +390,17 @@ def _rpc_polling_worker(
 def _leader_control_worker(
     args: "Args",
     pos_shared: "portal.SharedArray",
+    vel_shared: "portal.SharedArray",
+    feedback_shared: "portal.SharedArray",
+    pid_shared: "portal.SharedArray",
+    feedback_time: Any,
     cmd_queue: Any,
     stop_event: Any,
+    j3_csv_path: Optional[Path],
 ) -> None:
     """Owns the leader YAM hardware and runs the bilateral control
-    loop. Reads the latest follower pos from ``pos_shared`` (written by main's
-    foreground web-IO loop) and pushes commands for the follower into
+    loop. Reads the latest follower position and effort from shared memory
+    (written by main's foreground web-IO loop) and pushes commands for the follower into
     ``cmd_queue`` (drained by main and forwarded over RPC). Never touches the
     network itself."""
     override_log_level()
@@ -230,17 +413,39 @@ def _leader_control_worker(
         ee_mass=args.ee_mass,
         sim=args.sim,
     )
+    if args.trace_latency:
+        yam.motor_chain.motor_interface.trace_timestamps_enabled = True
     robot = YAMLeaderRobot(yam)
-    robot_current_kp = yam._kp
+    leader_kp = np.asarray(yam.get_robot_info()["kp"][:6], dtype=float).copy()
 
     control_rate = RateRecorder(name="yam-leader control", report_interval=1.0)
     control_rate.start()
+    j3_file = None
+    j3_writer = None
+    if j3_csv_path is not None:
+        try:
+            j3_file = j3_csv_path.open("w", newline="", buffering=1)
+            j3_writer = csv.writer(j3_file)
+            j3_writer.writerow(
+                ("monotonic_ns", "leader_angle_rad", "follower_angle_rad", "follower_pd_est_nm", "leader_feedback_nm")
+            )
+            logging.info("J3 telemetry: %s", j3_csv_path)
+        except OSError:
+            logging.exception("Could not start J3 telemetry recording")
+            if j3_file is not None:
+                j3_file.close()
+            j3_file = None
+            j3_writer = None
 
     # The encoder device states are populated only after the first CAN read, so get_info() can
     # raise on startup. Retry until the first reading lands before entering the control loop.
     while not stop_event.is_set():
         try:
-            current_joint_pos, current_button = robot.get_info()
+            initial_info = robot.wait_for_info(-1, 0.0)
+            if initial_info is None:
+                time.sleep(0.01)
+                continue
+            current_joint_pos, current_button, current_rx_ns, leader_read_ns, last_generation = initial_info
             break
         except RuntimeError:
             time.sleep(0.05)
@@ -255,39 +460,104 @@ def _leader_control_worker(
         steps = 100
         dt = duration / steps
         for i in range(steps):
+            if stop_event.is_set():
+                return
             cmd = joint_pos * i / steps + start_pos * (1 - i / steps)
-            cmd_queue.put(cmd)
+            _put_latest_command(cmd_queue, cmd)
             time.sleep(dt)
 
     synchronized = False
+    command_sequence = 0
     while not stop_event.is_set():
+        info = robot.wait_for_info(last_generation, timeout_s=0.02)
+        if info is None:
+            if synchronized and time.monotonic() - feedback_time.value > _FEEDBACK_TIMEOUT_S:
+                robot.enter_gravity_comp_idle()
+            continue
+        current_joint_pos, current_button, current_rx_ns, leader_read_ns, last_generation = info
         control_rate.track()
-        current_joint_pos, current_button = robot.get_info()
         if current_button[0] > 0.5:
             if not synchronized:
-                robot.update_kp_kd(kp=robot_current_kp * args.bilateral_kp, kd=np.ones(6) * 0.0)
-                robot.command_joint_pos(current_joint_pos[:6])
                 slow_move(current_joint_pos)
+                if stop_event.is_set():
+                    break
             else:
-                logging.info("clear bilateral pd")
-                robot.update_kp_kd(kp=np.ones(6) * 0.0, kd=np.ones(6) * 0.0)
-                current_follower_joint_pos = pos_shared.array.copy()
-                robot.command_joint_pos(current_follower_joint_pos[:6])
+                logging.info("clear bilateral feedback")
+                robot.enter_gravity_comp_idle()
             synchronized = not synchronized
-            while current_button[0] > 0.5:
-                time.sleep(0.03)
-                current_joint_pos, current_button = robot.get_info()
-
-        current_follower_joint_pos = pos_shared.array.copy()
+            while current_button[0] > 0.5 and not stop_event.is_set():
+                info = robot.wait_for_info(last_generation, timeout_s=0.03)
+                if info is not None:
+                    current_joint_pos, current_button, current_rx_ns, leader_read_ns, last_generation = info
 
         if synchronized:
-            cmd_queue.put(current_joint_pos)
-            # bilateral feedback to the leader, proportional to bilateral_kp
-            robot.command_joint_pos(current_follower_joint_pos[:6])
+            command_sequence += 1
+            if args.trace_latency and command_sequence % _LATENCY_TRACE_EVERY == 0:
+                trace = {
+                    "trace_id": command_sequence,
+                    "leader_can_rx_ns": current_rx_ns[:6].copy(),
+                    "leader_read_ns": leader_read_ns,
+                    "leader_queue_ns": time.monotonic_ns(),
+                }
+                _put_latest_command(cmd_queue, {"pos": current_joint_pos.copy(), "trace": trace})
+            else:
+                _put_latest_command(cmd_queue, current_joint_pos)
+            now = time.monotonic()
+            feedback_fresh = now - feedback_time.value <= _FEEDBACK_TIMEOUT_S
+            follower_pos = pos_shared.array[:6].copy()
+            follower_pd = pid_shared.array[:6].copy() if j3_writer is not None else None
+            record_ns = time.monotonic_ns() if j3_writer is not None else 0
+            leader_eff = np.zeros(6)
+            if feedback_fresh:
+                external_eff = feedback_shared.array[:6].copy()
+                follower_vel = vel_shared.array[:6].copy()
+                if (
+                    np.all(np.isfinite(current_joint_pos[:6]))
+                    and np.all(np.isfinite(follower_pos))
+                    and np.all(np.isfinite(external_eff))
+                    and np.all(np.isfinite(follower_vel))
+                ):
+                    feedback_source = _feedback_source(
+                        args.feedback_mode, current_joint_pos[:6], follower_pos, external_eff, leader_kp
+                    )
+                    # Positive source means the leader is ahead or the follower pushes forward.
+                    leader_eff = _leader_feedback_torque(
+                        feedback_source,
+                        follower_vel,
+                        current_joint_pos[:6] - follower_pos,
+                        args.bilateral_kp,
+                        args.bilateral_alpha,
+                        args.bilateral_beta,
+                    )
+                    robot.command_joint_torques(leader_eff)
+                else:
+                    robot.enter_gravity_comp_idle()
+            else:
+                robot.enter_gravity_comp_idle()
 
-        # Pace the loop: get_info reads cached state, so without this the worker spins a core and
-        # competes with the in-process robot_server control thread for the GIL, adding jitter.
-        time.sleep(_WORKER_LOOP_PERIOD_S)
+            if j3_writer is not None:
+                follower_angle = float(follower_pos[2]) if feedback_fresh else float("nan")
+                follower_pd_nm = float(follower_pd[2]) if feedback_fresh else float("nan")
+                try:
+                    j3_writer.writerow(
+                        (
+                            record_ns,
+                            float(current_joint_pos[2]),
+                            follower_angle,
+                            follower_pd_nm,
+                            float(leader_eff[2]),
+                        )
+                    )
+                except OSError:
+                    logging.exception("J3 telemetry recording stopped")
+                    j3_file.close()
+                    j3_writer = None
+
+    robot.enter_gravity_comp_idle()
+    if j3_file is not None and not j3_file.closed:
+        j3_file.close()
+    time.sleep(0.05)
+    yam.close()
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +575,7 @@ def _wait_for_dof(n_dofs_value: Any, timeout_s: float = 30.0) -> int:
     return int(n_dofs_value.value)
 
 
-def _put_latest_command(cmd_queue: Any, item: np.ndarray) -> None:
+def _put_latest_command(cmd_queue: Any, item: Any) -> None:
     """Non-blocking latest-wins enqueue onto a (bounded) command queue.
 
     Never blocks the caller: if the queue is full (the hardware worker has not drained it
@@ -326,6 +596,10 @@ def _build_follower_server(
     server_port: int,
     n_dofs_value: Any,
     pos_shared: "portal.SharedArray",
+    vel_shared: "portal.SharedArray",
+    feedback_shared: "portal.SharedArray",
+    pid_shared: "portal.SharedArray",
+    feedback_time: Any,
     cmd_queue: Any,
 ) -> portal.Server:
     """Build the portal.Server that exposes the follower YAM over RPC. Returned
@@ -349,12 +623,22 @@ def _build_follower_server(
     def _cmd_pos(joint_pos: np.ndarray) -> None:
         _put_latest_command(cmd_queue, np.asarray(joint_pos))
 
-    def _cmd_state(state: Dict[str, np.ndarray]) -> None:
+    def _cmd_state(state: Dict[str, Any]) -> None:
         key = "position" if "position" in state else "pos"
-        _put_latest_command(cmd_queue, np.asarray(state[key]))
+        if "trace" in state:
+            trace = dict(state["trace"], follower_rpc_ns=time.monotonic_ns())
+            _put_latest_command(cmd_queue, {"pos": np.asarray(state[key]), "trace": trace})
+        else:
+            _put_latest_command(cmd_queue, np.asarray(state[key]))
 
     def _get_obs() -> Dict[str, np.ndarray]:
-        return {"joint_pos": _get_pos()}
+        return {
+            "joint_pos": _get_pos(),
+            "joint_vel": vel_shared.array[: n_dofs_value.value].copy(),
+            "joint_eff_external": feedback_shared.array[: n_dofs_value.value].copy(),
+            "joint_eff_pd_est": pid_shared.array[: n_dofs_value.value].copy(),
+            "sample_age_s": np.array(max(0.0, time.monotonic() - feedback_time.value)),
+        }
 
     server = portal.Server(server_port)
     logging.info(f"Robot Server Binding to {server_port}")
@@ -370,14 +654,18 @@ def _run_leader_io_loop(
     client_robot: ClientRobot,
     cmd_queue: Any,
     pos_shared: "portal.SharedArray",
+    vel_shared: "portal.SharedArray",
+    feedback_shared: "portal.SharedArray",
+    pid_shared: "portal.SharedArray",
+    feedback_time: Any,
     stop_event: Any,
     io_rate: RateRecorder,
 ) -> None:
     """Foreground loop for leader mode: drain commands from the bilateral
     control worker onto the follower over RPC, and pull the follower's latest
-    joint_pos into ``pos_shared`` so the worker can read it for bilateral
-    feedback."""
+    joint state into shared memory so the worker can read it for bilateral feedback."""
     while not stop_event.is_set():
+        loop_started = time.monotonic()
         # Drain to the newest command and drop any stale backlog: the control worker can enqueue
         # faster than each blocking RPC round-trip drains, so replaying every queued command would
         # make the follower lag further and further behind.
@@ -389,16 +677,42 @@ def _run_leader_io_loop(
                 break
         try:
             if cmd is not None:
-                client_robot.command_joint_pos(cmd)
-            pos = client_robot.get_joint_pos()
+                if isinstance(cmd, dict):
+                    trace = dict(cmd["trace"], leader_io_ns=time.monotonic_ns())
+                    client_robot.command_joint_state({"pos": cmd["pos"], "trace": trace})
+                else:
+                    client_robot.command_joint_pos(cmd)
+            request_started = time.monotonic()
+            obs = client_robot.get_observations()
+            request_elapsed = time.monotonic() - request_started
+            pos = np.asarray(obs["joint_pos"])
+            vel = np.asarray(obs["joint_vel"])
+            external_eff = np.asarray(obs["joint_eff_external"])
+            pd_eff = np.asarray(obs.get("joint_eff_pd_est", np.full_like(external_eff, np.nan)))
+            sample_age = float(obs["sample_age_s"])
+            if not np.all(np.isfinite(pos)):
+                raise ValueError("follower returned non-finite joint positions")
             pos_shared.array[: len(pos)] = pos
+            if (
+                sample_age + request_elapsed > _FEEDBACK_TIMEOUT_S
+                or not np.all(np.isfinite(external_eff))
+                or not np.all(np.isfinite(vel))
+            ):
+                feedback_time.value = 0.0
+            else:
+                feedback_shared.array[: len(external_eff)] = external_eff
+                pid_shared.array[: len(pd_eff)] = pd_eff
+                vel_shared.array[: len(vel)] = vel
+                feedback_time.value = time.monotonic()
             io_rate.track()
         except Exception as e:
             # Ride out a transient follower/network blip. Without this the exception escapes to
             # run_leader, whose finally: cleanup() calls proc.kill() on the control worker while the
-            # leader arm is energized in bilateral PD — an abrupt loss of control of a powered arm.
+            # leader arm is energized — an abrupt loss of control of a powered arm.
             logging.error(f"[yam-leader web-port io] error: {e}")
+            feedback_time.value = 0.0
             time.sleep(0.1)
+        time.sleep(max(0.0, _LEADER_IO_PERIOD_S - (time.monotonic() - loop_started)))
 
 
 def _run_viewer_loop(
@@ -458,16 +772,22 @@ def _run_viewer_loop(
 
 
 def cleanup(resources: Resources) -> None:
-    """Tear down everything accumulated into ``resources``. Mirrors
-    xdof/envs/launch.py's ``cleanup``: signal workers to stop, kill their
-    processes, then release shared memory."""
+    """Stop workers, allow hardware commands to return to idle, then release shared memory."""
     logging.info("exiting")
     if resources.stop_event is not None:
         resources.stop_event.set()
     for proc in resources.processes:
-        proc.kill()
+        proc.join(timeout=2.0)
+        if proc.running:
+            proc.kill()
     if resources.pos_shared is not None:
         resources.pos_shared.close()
+    if resources.vel_shared is not None:
+        resources.vel_shared.close()
+    if resources.feedback_shared is not None:
+        resources.feedback_shared.close()
+    if resources.pid_shared is not None:
+        resources.pid_shared.close()
     logging.info("Processes terminated.")
 
 
@@ -481,6 +801,10 @@ def cleanup(resources: Resources) -> None:
 def run_follower(args: Args) -> None:
     resources = Resources(
         pos_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
+        vel_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
+        feedback_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
+        pid_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
+        feedback_time=portal.mp.Value("d", 0.0),
         stop_event=portal.mp.Event(),
     )
     spawn = partial(_spawn_into, resources.processes)
@@ -496,6 +820,10 @@ def run_follower(args: Args) -> None:
             _yam_polling_worker,
             args,
             resources.pos_shared,
+            resources.vel_shared,
+            resources.feedback_shared,
+            resources.pid_shared,
+            resources.feedback_time,
             n_dofs_value,
             cmd_queue,
             resources.stop_event,
@@ -506,7 +834,16 @@ def run_follower(args: Args) -> None:
     n_dofs = _wait_for_dof(n_dofs_value)
     logging.info(f"Follower YAM ready, num_dofs={n_dofs}")
 
-    server = _build_follower_server(args.server_port, n_dofs_value, resources.pos_shared, cmd_queue)
+    server = _build_follower_server(
+        args.server_port,
+        n_dofs_value,
+        resources.pos_shared,
+        resources.vel_shared,
+        resources.feedback_shared,
+        resources.pid_shared,
+        resources.feedback_time,
+        cmd_queue,
+    )
 
     try:
         server.start()  # blocks
@@ -521,15 +858,21 @@ def run_follower(args: Args) -> None:
 
 def run_leader(args: Args) -> None:
     client_robot = ClientRobot(args.server_port, host=args.server_host)
-    initial_follower_pos = client_robot.get_joint_pos()
+    initial_follower_obs = client_robot.get_observations()
+    initial_follower_pos = initial_follower_obs["joint_pos"]
     logging.info(f"Initial follower joint pos: {initial_follower_pos}")
 
     resources = Resources(
         pos_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
+        vel_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
+        feedback_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
+        pid_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
+        feedback_time=portal.mp.Value("d", 0.0),
         stop_event=portal.mp.Event(),
     )
     resources.pos_shared.array[:] = initial_follower_pos
-    cmd_queue = portal.mp.Queue()
+    cmd_queue = portal.mp.Queue(maxsize=1)
+    j3_csv_path = Path("/tmp") / f"i2rt_j3_{args.can_channel}_{os.getpid()}.csv" if args.record_j3 else None
 
     spawn = partial(_spawn_into, resources.processes)
     spawn(
@@ -537,8 +880,13 @@ def run_leader(args: Args) -> None:
             _leader_control_worker,
             args,
             resources.pos_shared,
+            resources.vel_shared,
+            resources.feedback_shared,
+            resources.pid_shared,
+            resources.feedback_time,
             cmd_queue,
             resources.stop_event,
+            j3_csv_path,
             name="yam-leader-control",
         )
     )
@@ -546,7 +894,17 @@ def run_leader(args: Args) -> None:
     io_rate = RateRecorder(name="yam-leader web-port io", report_interval=1.0)
     io_rate.start()
     try:
-        _run_leader_io_loop(client_robot, cmd_queue, resources.pos_shared, resources.stop_event, io_rate)
+        _run_leader_io_loop(
+            client_robot,
+            cmd_queue,
+            resources.pos_shared,
+            resources.vel_shared,
+            resources.feedback_shared,
+            resources.pid_shared,
+            resources.feedback_time,
+            resources.stop_event,
+            io_rate,
+        )
     except KeyboardInterrupt:
         pass
     except Exception:
@@ -554,6 +912,15 @@ def run_leader(args: Args) -> None:
         raise
     finally:
         cleanup(resources)
+        client_robot.close()
+        if j3_csv_path is not None and j3_csv_path.exists():
+            plot_script = Path(__file__).resolve().parents[1] / "bimanual_lead_follower" / "plot_j3.py"
+            try:
+                subprocess.run(
+                    [sys.executable, str(plot_script), "--csv-path", str(j3_csv_path)], check=True, timeout=15
+                )
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                logging.exception("Could not plot J3 telemetry from %s", j3_csv_path)
 
 
 def run_visualizer_local(args: Args) -> None:
@@ -572,6 +939,10 @@ def run_visualizer_local(args: Args) -> None:
             _yam_polling_worker,
             args,
             resources.pos_shared,
+            None,
+            None,
+            None,
+            None,
             n_dofs_value,
             None,  # no cmd_queue — viewer doesn't send commands
             resources.stop_event,
@@ -649,6 +1020,18 @@ def main(args: Args) -> None:
 
     if args.mode == "leader" and args.sim:
         raise ValueError("Leader mode requires real hardware (--sim is not supported)")
+
+    if args.mode == "leader" and (not math.isfinite(args.bilateral_kp) or args.bilateral_kp < 0.0):
+        raise ValueError("--bilateral-kp must be a finite non-negative number")
+
+    if args.mode == "leader" and (not math.isfinite(args.bilateral_alpha) or args.bilateral_alpha < 0.0):
+        raise ValueError("--bilateral-alpha must be a finite non-negative number")
+
+    if args.mode == "leader" and (not math.isfinite(args.bilateral_beta) or args.bilateral_beta < 0.0):
+        raise ValueError("--bilateral-beta must be a finite non-negative number")
+
+    if args.mode == "leader" and args.feedback_mode not in ("angle", "torque"):
+        raise ValueError("--feedback-mode must be 'angle' or 'torque'")
 
     runners: Dict[str, Callable[[Args], None]] = {
         "follower": run_follower,

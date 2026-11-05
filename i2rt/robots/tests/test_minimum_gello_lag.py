@@ -71,7 +71,7 @@ def test_follower_worker_applies_newest_setpoint_not_backlog() -> None:
 
     worker = threading.Thread(
         target=mg._yam_polling_worker,
-        args=(args, pos_shared, n_dofs_value, cmd_queue, stop_event, "test-follower"),
+        args=(args, pos_shared, None, None, None, None, n_dofs_value, cmd_queue, stop_event, "test-follower"),
         daemon=True,
     )
     worker.start()

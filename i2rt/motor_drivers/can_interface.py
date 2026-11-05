@@ -23,6 +23,10 @@ class CanInterface:
         self.name = name
         self.receive_mode = receive_mode
         self.use_buffered_reader = use_buffered_reader
+        # Host monotonic timestamps for optional CAN-to-CAN latency tracing.
+        self.trace_timestamps_enabled = False
+        self._last_tx_monotonic_ns = 0
+        self._last_rx_monotonic_ns = 0
         logging.info(f"Can interface {self.name} use_buffered_reader: {use_buffered_reader}")
         if use_buffered_reader:
             # Initialize BufferedReader for asynchronous message handling
@@ -52,6 +56,8 @@ class CanInterface:
             try:
                 # logging.info("Sending message: %s at %f", message, time.time())
                 self.bus.send(message)
+                if self.trace_timestamps_enabled:
+                    self._last_tx_monotonic_ns = time.monotonic_ns()
                 response = self._receive_message(motor_id, timeout=0.01)
                 # logging.info("Received response: %s at %f", response, time.time())
 
@@ -127,6 +133,8 @@ class CanInterface:
             else:
                 message = self.bus.recv(timeout=0.001)
             if message:
+                if self.trace_timestamps_enabled:
+                    self._last_rx_monotonic_ns = time.monotonic_ns()
                 return message
         if not supress_warning:
             logging.warning(
