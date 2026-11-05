@@ -69,6 +69,7 @@ def test_new_command_is_accepted_during_can_exchange() -> None:
     driver.motor_list = [(1, "DM4340")]
     driver.command_lock = threading.RLock()
     driver.state_lock = threading.Lock()
+    driver.state_updated_event = threading.Event()
     driver.commands = [MotorCmd(torque=0.0)]
     driver.running = True
     driver.enable_auto_recovery = False
@@ -118,6 +119,7 @@ def test_new_command_is_accepted_during_can_exchange() -> None:
         control_thread.join(timeout=1.0)
 
     assert not control_thread.is_alive()
+    assert driver.state_updated_event.is_set()
     assert driver.commands[0].torque == 1.0
 
 
@@ -168,3 +170,47 @@ def test_driver_records_first_send_for_each_trace_and_joint() -> None:
     assert records[0]["leader_can_rx_ns"] == tx_ns - 3_000_000
     assert records[0]["follower_can_tx_ns"] == tx_ns
     assert driver.drain_latency_records() == []
+
+
+def test_driver_records_follower_feedback_to_leader_can_send() -> None:
+    driver = DMChainCanInterface.__new__(DMChainCanInterface)
+    driver.motor_list = [(1, "DM4340")]
+    driver.motor_direction = np.ones(1)
+    driver.motor_offset = np.zeros(1)
+    driver._latency_records = deque(maxlen=100)
+    driver._latency_lock = threading.Lock()
+    driver._last_logged_trace_id = [-1]
+    tx_ns = time.monotonic_ns()
+    driver.motor_interface = SimpleNamespace(
+        control_mode=ControlMode.MIT,
+        set_control=lambda **_kwargs: FeedbackFrameInfo(
+            id=1,
+            error_code="0x1",
+            error_message="normal",
+            position=0.0,
+            velocity=0.0,
+            torque=0.0,
+            temperature_mos=0.0,
+            temperature_rotor=0.0,
+            tx_monotonic_ns=tx_ns,
+        ),
+    )
+    trace = {
+        "trace_id": 10,
+        "follower_can_rx_ns": np.array([tx_ns - 4_000_000]),
+        "follower_publish_ns": tx_ns - 3_000_000,
+        "follower_rpc_get_ns": tx_ns - 2_000_000,
+        "leader_rpc_rx_ns": tx_ns - 1_500_000,
+        "leader_feedback_command_ns": tx_ns - 1_000_000,
+        "robot_update_ns": tx_ns - 500_000,
+        "driver_accept_ns": tx_ns - 400_000,
+    }
+
+    driver._set_commands([MotorCmd(torque=0.2, trace=trace)])
+
+    records = driver.drain_latency_records()
+    assert len(records) == 1
+    assert records[0]["joint"] == 1
+    assert records[0]["follower_can_rx_ns"] == tx_ns - 4_000_000
+    assert records[0]["leader_can_tx_ns"] == tx_ns
+    assert "follower_can_tx_ns" not in records[0]

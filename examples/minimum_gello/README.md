@@ -58,7 +58,7 @@ Press **button 0** on the teaching handle to synchronize. Press again to desync.
 | `--bilateral-kp` | `0.0` | Any finite non-negative angle/torque feedback gain; zero disables the leader's extra feedback torque |
 | `--bilateral-alpha` | `0.0` | Non-negative speed attenuation coefficient in s/rad; per-joint gain is `bilateral_kp / (1 + bilateral_alpha * abs(follower_joint_velocity))` |
 | `--bilateral-beta` | `1.0` | Non-negative angle attenuation parameter; for positive beta, multiplies feedback by `(2/pi) * atan((100 / beta) * abs(angle_error))`; angle mode uses `angle_error = leader_angle - follower_angle - 0.020 s * leader_velocity`, torque mode uses the raw angle difference; zero disables angle attenuation |
-| `--trace-latency` | `False` | Tag one in ten leader commands and write per-joint CAN receive-to-send timestamps to `/tmp/i2rt_can_latency_<channel>_<pid>.csv` on the follower; use on one host |
+| `--trace-latency` | `False` | Sample forward CAN-to-CAN latency in `/tmp/i2rt_can_latency_<follower_channel>_<pid>.csv` and reverse feedback latency in `/tmp/i2rt_feedback_latency_<leader_channel>_<pid>.csv`; use on one host |
 | `--record-j3` | `False` | In leader mode, save J3 angles, follower CAN-reported motor torque, and leader feedback torque command to CSV and render a standalone SVG after shutdown |
 | `--ee-mass` | XML default | Override link_6 mass (kg) for gravity compensation with different handles |
 

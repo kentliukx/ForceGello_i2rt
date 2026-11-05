@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial, wraps
 from pathlib import Path
@@ -34,7 +35,7 @@ _WORKER_LOOP_PERIOD_S = 0.002
 The leader control worker waits for fresh CAN-backed joint state instead."""
 
 _LEADER_IO_PERIOD_S = 0.002
-"""Check the latest leader command and follower feedback about every 2 ms."""
+"""Poll follower feedback every 2 ms; command queue arrivals wake IO sooner."""
 
 _FEEDBACK_TIMEOUT_S = 0.2
 _LEADER_ANGLE_PREDICTION_S = 0.02
@@ -54,6 +55,21 @@ _LATENCY_FIELDS = (
     "driver_accept_ns",
     "follower_can_tx_ns",
 )
+_FEEDBACK_LATENCY_FIELDS = (
+    "trace_id",
+    "joint",
+    "follower_can_rx_ns",
+    "follower_publish_ns",
+    "follower_rpc_get_ns",
+    "leader_rpc_rx_ns",
+    "leader_feedback_command_ns",
+    "robot_update_ns",
+    "driver_accept_ns",
+    "leader_can_tx_ns",
+)
+_FEEDBACK_PUBLISH_INDEX = 6
+_FEEDBACK_RPC_GET_INDEX = 7
+_FEEDBACK_RPC_RX_INDEX = 8
 
 
 def _leader_angle_target(follower_pos: np.ndarray, leader_vel: np.ndarray) -> np.ndarray:
@@ -171,8 +187,8 @@ class YAMLeaderRobot:
         assert joint_pos.shape[0] == 6
         self._robot.command_joint_pos(joint_pos)
 
-    def command_joint_torques(self, torques: np.ndarray) -> None:
-        self._robot.command_joint_torques(torques)
+    def command_joint_torques(self, torques: np.ndarray, trace: Optional[Dict[str, Any]] = None) -> None:
+        self._robot.command_joint_torques(torques, trace=trace)
 
     def enter_gravity_comp_idle(self) -> None:
         self._robot.enter_gravity_comp_idle()
@@ -218,6 +234,10 @@ class Resources:
     vel_shared: Optional[portal.SharedArray] = None
     feedback_shared: Optional[portal.SharedArray] = None
     measured_shared: Optional[portal.SharedArray] = None
+    feedback_sample_trace_shared: Optional[portal.SharedArray] = None
+    feedback_trace_shared: Optional[portal.SharedArray] = None
+    feedback_sample_lock: Optional[Any] = None
+    feedback_trace_lock: Optional[Any] = None
     feedback_time: Optional[Any] = None
     stop_event: Optional[Any] = None
 
@@ -251,6 +271,49 @@ def _log_latency_summary(records: List[Dict[str, int]], channel: str) -> None:
         )
 
 
+def _log_feedback_latency_summary(records: List[Dict[str, int]], channel: str) -> None:
+    """Report follower CAN reception to leader CAN transmission for traced feedback."""
+    for joint in sorted({record["joint"] for record in records}):
+        totals_ms = np.array(
+            [
+                (record["leader_can_tx_ns"] - record["follower_can_rx_ns"]) / 1e6
+                for record in records
+                if record["joint"] == joint
+            ]
+        )
+        p50, p95 = np.percentile(totals_ms, [50, 95])
+        logging.info(
+            "[feedback CAN latency %s joint%d] n=%d follower RX to leader TX p50=%.2f ms p95=%.2f ms max=%.2f ms",
+            channel,
+            joint,
+            len(totals_ms),
+            p50,
+            p95,
+            np.max(totals_ms),
+        )
+
+
+def _make_feedback_latency_trace(trace_times: np.ndarray, trace_id: int, command_ns: int) -> Optional[Dict[str, Any]]:
+    """Use only complete, ordered follower samples for reverse CAN latency."""
+    if trace_times.shape != (9,) or not np.all(trace_times[:6] > 0):
+        return None
+    if not (
+        np.max(trace_times[:6]) <= trace_times[_FEEDBACK_PUBLISH_INDEX]
+        <= trace_times[_FEEDBACK_RPC_GET_INDEX]
+        <= trace_times[_FEEDBACK_RPC_RX_INDEX]
+        <= command_ns
+    ):
+        return None
+    return {
+        "trace_id": trace_id,
+        "follower_can_rx_ns": trace_times[:6].copy(),
+        "follower_publish_ns": int(trace_times[_FEEDBACK_PUBLISH_INDEX]),
+        "follower_rpc_get_ns": int(trace_times[_FEEDBACK_RPC_GET_INDEX]),
+        "leader_rpc_rx_ns": int(trace_times[_FEEDBACK_RPC_RX_INDEX]),
+        "leader_feedback_command_ns": command_ns,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Background workers. Each runs in its own portal.Process so the foreground
 # loop (web IO server, web IO client, or MuJoCo viewer) never blocks on
@@ -269,6 +332,8 @@ def _yam_polling_worker(
     cmd_queue: Any,
     stop_event: Any,
     rate_name: str,
+    feedback_sample_trace_shared: Optional["portal.SharedArray"] = None,
+    feedback_sample_lock: Optional[Any] = None,
 ) -> None:
     """Owns the YAM hardware. Streams joint_pos into ``pos_shared`` at hardware
     rate; if ``cmd_queue`` is provided, drains pending commands onto the YAM.
@@ -299,6 +364,7 @@ def _yam_polling_worker(
         latency_writer.writeheader()
         logging.info("CAN latency trace: %s", latency_path)
     next_latency_report = time.monotonic() + _LATENCY_REPORT_PERIOD_S
+    sample_lock = feedback_sample_lock if feedback_sample_lock is not None else nullcontext()
     while not stop_event.is_set():
         if cmd_queue is not None:
             # The queue wakes this worker as soon as a command arrives. A short timeout
@@ -342,18 +408,23 @@ def _yam_polling_worker(
                     vel = obs["joint_vel"]
                     measured_eff = obs["joint_eff"]
                     external_eff = obs["joint_eff"] - yam.get_motor_torques()
-                feedback_shared.array[: len(external_eff)] = external_eff
-                if measured_shared is not None:
-                    measured_shared.array[: len(measured_eff)] = measured_eff
-                vel_shared.array[: len(vel)] = vel
             else:
                 pos = yam.get_joint_pos()
-            pos_shared.array[: len(pos)] = pos
-            if feedback_shared is not None:
-                if isinstance(yam, MotorChainRobot):
-                    feedback_time.value = np.min(feedback_obs["can_rx_monotonic_ns"][:6]) / 1e9
-                else:
-                    feedback_time.value = time.monotonic()
+            with sample_lock:
+                if feedback_shared is not None:
+                    feedback_shared.array[: len(external_eff)] = external_eff
+                    if measured_shared is not None:
+                        measured_shared.array[: len(measured_eff)] = measured_eff
+                    vel_shared.array[: len(vel)] = vel
+                pos_shared.array[: len(pos)] = pos
+                if feedback_shared is not None:
+                    if isinstance(yam, MotorChainRobot):
+                        if feedback_sample_trace_shared is not None:
+                            feedback_sample_trace_shared.array[:6] = feedback_obs["can_rx_monotonic_ns"][:6]
+                            feedback_sample_trace_shared.array[_FEEDBACK_PUBLISH_INDEX] = time.monotonic_ns()
+                        feedback_time.value = np.min(feedback_obs["can_rx_monotonic_ns"][:6]) / 1e9
+                    else:
+                        feedback_time.value = time.monotonic()
             rate.track()
         except Exception as e:
             logging.error(f"[{rate_name}] error: {e}")
@@ -411,6 +482,8 @@ def _leader_control_worker(
     cmd_queue: Any,
     stop_event: Any,
     j3_csv_path: Optional[Path],
+    feedback_trace_shared: Optional["portal.SharedArray"] = None,
+    feedback_trace_lock: Optional[Any] = None,
 ) -> None:
     """Owns the leader YAM hardware and runs the feedback control
     loop. Reads the latest follower position and effort from shared memory
@@ -477,10 +550,29 @@ def _leader_control_worker(
         except RuntimeError:
             time.sleep(0.05)
     else:
+        if j3_file is not None:
+            j3_file.close()
+        yam.close()
         return  # stop requested before the encoder became ready
     current_follower_joint_pos = pos_shared.array.copy()
     logging.info(f"Current leader joint pos: {current_joint_pos}")
     logging.info(f"Current follower joint pos: {current_follower_joint_pos}")
+
+    feedback_latency_file = None
+    feedback_latency_writer = None
+    if args.trace_latency and feedback_trace_shared is not None:
+        try:
+            latency_path = Path("/tmp") / f"i2rt_feedback_latency_{args.can_channel}_{os.getpid()}.csv"
+            feedback_latency_file = latency_path.open("w", newline="")
+            feedback_latency_writer = csv.DictWriter(feedback_latency_file, fieldnames=_FEEDBACK_LATENCY_FIELDS)
+            feedback_latency_writer.writeheader()
+            logging.info("Feedback CAN latency trace: %s", latency_path)
+        except OSError:
+            logging.exception("Could not start feedback latency recording")
+            if feedback_latency_file is not None:
+                feedback_latency_file.close()
+            feedback_latency_file = None
+            feedback_latency_writer = None
 
     def slow_move(joint_pos: np.ndarray, duration: float = 3.0) -> None:
         start_pos = pos_shared.array.copy()
@@ -495,6 +587,8 @@ def _leader_control_worker(
 
     synchronized = False
     command_sequence = 0
+    next_feedback_report = time.monotonic() + _LATENCY_REPORT_PERIOD_S
+    trace_lock = feedback_trace_lock if feedback_trace_lock is not None else nullcontext()
     while not stop_event.is_set():
         info = robot.wait_for_info(last_generation, timeout_s=0.02)
         if info is None:
@@ -532,9 +626,17 @@ def _leader_control_worker(
                 robot.enter_gravity_comp_idle()
                 continue
             now = time.monotonic()
-            feedback_fresh = now - feedback_time.value <= _FEEDBACK_TIMEOUT_S
-            follower_pos = pos_shared.array[:6].copy()
-            follower_vel = vel_shared.array[:6].copy()
+            with trace_lock:
+                feedback_fresh = now - feedback_time.value <= _FEEDBACK_TIMEOUT_S
+                follower_pos = pos_shared.array[:6].copy()
+                follower_vel = vel_shared.array[:6].copy()
+                follower_measured_eff = measured_shared.array[:6].copy() if j3_writer is not None else None
+                external_eff = feedback_shared.array[:6].copy() if feedback_fresh else None
+                feedback_trace_times = (
+                    feedback_trace_shared.array.copy()
+                    if feedback_fresh and feedback_trace_shared is not None and feedback_latency_writer is not None
+                    else None
+                )
             command_sequence += 1
             command = {"pos": current_joint_pos.copy(), "vel": current_joint_vel.copy()}
             if args.trace_latency and command_sequence % _LATENCY_TRACE_EVERY == 0:
@@ -545,11 +647,9 @@ def _leader_control_worker(
                     "leader_queue_ns": time.monotonic_ns(),
                 }
             _put_latest_command(cmd_queue, command)
-            follower_measured_eff = measured_shared.array[:6].copy() if j3_writer is not None else None
             record_ns = time.monotonic_ns() if j3_writer is not None else 0
             leader_eff = np.zeros(6)
             if feedback_fresh:
-                external_eff = feedback_shared.array[:6].copy()
                 if (
                     np.all(np.isfinite(current_joint_pos[:6]))
                     and np.all(np.isfinite(follower_pos))
@@ -574,7 +674,16 @@ def _leader_control_worker(
                         args.bilateral_alpha,
                         args.bilateral_beta,
                     )
-                    robot.command_joint_torques(leader_eff)
+                    feedback_trace = None
+                    if (
+                        feedback_latency_writer is not None
+                        and feedback_trace_times is not None
+                        and command_sequence % _LATENCY_TRACE_EVERY == 0
+                    ):
+                        feedback_trace = _make_feedback_latency_trace(
+                            feedback_trace_times, command_sequence, time.monotonic_ns()
+                        )
+                    robot.command_joint_torques(leader_eff, trace=feedback_trace)
                 else:
                     robot.enter_gravity_comp_idle()
             else:
@@ -598,10 +707,29 @@ def _leader_control_worker(
                     j3_file.close()
                     j3_writer = None
 
+        if feedback_latency_writer is not None and time.monotonic() >= next_feedback_report:
+            records = yam.motor_chain.drain_latency_records()
+            if records:
+                try:
+                    feedback_latency_writer.writerows(records)
+                    feedback_latency_file.flush()
+                    _log_feedback_latency_summary(records, args.can_channel)
+                except OSError:
+                    logging.exception("Feedback latency recording stopped")
+                    feedback_latency_file.close()
+                    feedback_latency_writer = None
+            next_feedback_report = time.monotonic() + _LATENCY_REPORT_PERIOD_S
+
     robot.enter_gravity_comp_idle()
     if j3_file is not None and not j3_file.closed:
         j3_file.close()
     time.sleep(0.05)
+    if feedback_latency_writer is not None:
+        try:
+            feedback_latency_writer.writerows(yam.motor_chain.drain_latency_records())
+        except OSError:
+            logging.exception("Could not flush feedback latency recording")
+        feedback_latency_file.close()
     yam.close()
 
 
@@ -646,6 +774,8 @@ def _build_follower_server(
     measured_shared: "portal.SharedArray",
     feedback_time: Any,
     cmd_queue: Any,
+    feedback_sample_trace_shared: Optional["portal.SharedArray"] = None,
+    feedback_sample_lock: Optional[Any] = None,
 ) -> portal.Server:
     """Build the portal.Server that exposes the follower YAM over RPC. Returned
     unstarted; caller does ``server.start()`` to block."""
@@ -679,14 +809,21 @@ def _build_follower_server(
             packet["trace"] = dict(state["trace"], follower_rpc_ns=time.monotonic_ns())
         _put_latest_command(cmd_queue, packet)
 
+    sample_lock = feedback_sample_lock if feedback_sample_lock is not None else nullcontext()
+
     def _get_obs() -> Dict[str, np.ndarray]:
-        return {
-            "joint_pos": _get_pos(),
-            "joint_vel": vel_shared.array[: n_dofs_value.value].copy(),
-            "joint_eff_measured": measured_shared.array[: n_dofs_value.value].copy(),
-            "joint_eff_external": feedback_shared.array[: n_dofs_value.value].copy(),
-            "sample_age_s": np.array(max(0.0, time.monotonic() - feedback_time.value)),
-        }
+        with sample_lock:
+            obs = {
+                "joint_pos": _get_pos(),
+                "joint_vel": vel_shared.array[: n_dofs_value.value].copy(),
+                "joint_eff_measured": measured_shared.array[: n_dofs_value.value].copy(),
+                "joint_eff_external": feedback_shared.array[: n_dofs_value.value].copy(),
+                "sample_age_s": np.array(max(0.0, time.monotonic() - feedback_time.value)),
+            }
+            if feedback_sample_trace_shared is not None:
+                obs["feedback_trace_ns"] = feedback_sample_trace_shared.array.copy()
+                obs["follower_rpc_get_ns"] = np.array(time.monotonic_ns())
+            return obs
 
     server = portal.Server(server_port)
     logging.info(f"Robot Server Binding to {server_port}")
@@ -708,21 +845,28 @@ def _run_leader_io_loop(
     feedback_time: Any,
     stop_event: Any,
     io_rate: RateRecorder,
+    feedback_trace_shared: Optional["portal.SharedArray"] = None,
+    feedback_trace_lock: Optional[Any] = None,
 ) -> None:
     """Foreground loop for leader mode: drain commands from the bilateral
     control worker onto the follower over RPC, and pull the follower's latest
     joint state into shared memory so the worker can read it for bilateral feedback."""
+    next_observation = time.monotonic()
+    trace_lock = feedback_trace_lock if feedback_trace_lock is not None else nullcontext()
     while not stop_event.is_set():
-        loop_started = time.monotonic()
-        # Drain to the newest command and drop any stale backlog: the control worker can enqueue
-        # faster than each blocking RPC round-trip drains, so replaying every queued command would
-        # make the follower lag further and further behind.
-        cmd = None
+        # Wake as soon as a command arrives, or poll feedback at least every 2 ms.
+        try:
+            cmd = cmd_queue.get(timeout=max(0.0, next_observation - time.monotonic()))
+        except queue.Empty:
+            cmd = None
+        # Keep only the newest setpoint if the control worker outpaced the RPC round trip.
         while True:
             try:
                 cmd = cmd_queue.get_nowait()
             except queue.Empty:
                 break
+        if stop_event.is_set():
+            break
         try:
             if cmd is not None:
                 if isinstance(cmd, dict):
@@ -734,6 +878,7 @@ def _run_leader_io_loop(
                     client_robot.command_joint_pos(cmd)
             request_started = time.monotonic()
             obs = client_robot.get_observations()
+            leader_rpc_rx_ns = time.monotonic_ns() if feedback_trace_shared is not None else 0
             request_elapsed = time.monotonic() - request_started
             pos = np.asarray(obs["joint_pos"])
             vel = np.asarray(obs["joint_vel"])
@@ -742,27 +887,36 @@ def _run_leader_io_loop(
             sample_age = float(obs["sample_age_s"])
             if not np.all(np.isfinite(pos)):
                 raise ValueError("follower returned non-finite joint positions")
-            pos_shared.array[: len(pos)] = pos
-            if (
-                sample_age + request_elapsed > _FEEDBACK_TIMEOUT_S
-                or not np.all(np.isfinite(external_eff))
-                or not np.all(np.isfinite(vel))
-            ):
-                feedback_time.value = 0.0
-            else:
-                feedback_shared.array[: len(external_eff)] = external_eff
-                measured_shared.array[: len(measured_eff)] = measured_eff
-                vel_shared.array[: len(vel)] = vel
-                feedback_time.value = time.monotonic() - sample_age - request_elapsed
+            with trace_lock:
+                pos_shared.array[: len(pos)] = pos
+                if (
+                    sample_age + request_elapsed > _FEEDBACK_TIMEOUT_S
+                    or not np.all(np.isfinite(external_eff))
+                    or not np.all(np.isfinite(vel))
+                ):
+                    feedback_time.value = 0.0
+                else:
+                    feedback_shared.array[: len(external_eff)] = external_eff
+                    measured_shared.array[: len(measured_eff)] = measured_eff
+                    vel_shared.array[: len(vel)] = vel
+                    if feedback_trace_shared is not None and "feedback_trace_ns" in obs:
+                        sample_trace = np.asarray(obs["feedback_trace_ns"], dtype=np.int64)
+                        if sample_trace.shape == (7,) and np.all(sample_trace[:6] > 0):
+                            feedback_trace_shared.array[:7] = sample_trace
+                            feedback_trace_shared.array[_FEEDBACK_RPC_GET_INDEX] = int(obs["follower_rpc_get_ns"])
+                            feedback_trace_shared.array[_FEEDBACK_RPC_RX_INDEX] = leader_rpc_rx_ns
+                    feedback_time.value = time.monotonic() - sample_age - request_elapsed
             io_rate.track()
+            next_observation = request_started + _LEADER_IO_PERIOD_S
         except Exception as e:
             # Ride out a transient follower/network blip. Without this the exception escapes to
             # run_leader, whose finally: cleanup() calls proc.kill() on the control worker while the
             # leader arm is energized — an abrupt loss of control of a powered arm.
             logging.error(f"[yam-leader web-port io] error: {e}")
-            feedback_time.value = 0.0
+            with trace_lock:
+                feedback_time.value = 0.0
             time.sleep(0.1)
-        time.sleep(max(0.0, _LEADER_IO_PERIOD_S - (time.monotonic() - loop_started)))
+            next_observation = time.monotonic()
 
 
 def _run_viewer_loop(
@@ -838,6 +992,10 @@ def cleanup(resources: Resources) -> None:
         resources.feedback_shared.close()
     if resources.measured_shared is not None:
         resources.measured_shared.close()
+    if resources.feedback_sample_trace_shared is not None:
+        resources.feedback_sample_trace_shared.close()
+    if resources.feedback_trace_shared is not None:
+        resources.feedback_trace_shared.close()
     logging.info("Processes terminated.")
 
 
@@ -854,6 +1012,8 @@ def run_follower(args: Args) -> None:
         vel_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
         feedback_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
         measured_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
+        feedback_sample_trace_shared=portal.SharedArray(shape=(7,), dtype=np.int64) if args.trace_latency else None,
+        feedback_sample_lock=portal.mp.Lock() if args.trace_latency else None,
         feedback_time=portal.mp.Value("d", 0.0),
         stop_event=portal.mp.Event(),
     )
@@ -878,6 +1038,8 @@ def run_follower(args: Args) -> None:
             cmd_queue,
             resources.stop_event,
             "follower yam-hardware",
+            resources.feedback_sample_trace_shared,
+            resources.feedback_sample_lock,
             name="follower-yam-control",
         )
     )
@@ -893,6 +1055,8 @@ def run_follower(args: Args) -> None:
         resources.measured_shared,
         resources.feedback_time,
         cmd_queue,
+        resources.feedback_sample_trace_shared,
+        resources.feedback_sample_lock,
     )
 
     try:
@@ -921,6 +1085,8 @@ def run_leader(args: Args) -> None:
         vel_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
         feedback_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
         measured_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
+        feedback_trace_shared=portal.SharedArray(shape=(9,), dtype=np.int64) if args.trace_latency else None,
+        feedback_trace_lock=portal.mp.Lock() if args.trace_latency else None,
         feedback_time=portal.mp.Value("d", 0.0),
         stop_event=portal.mp.Event(),
     )
@@ -945,6 +1111,8 @@ def run_leader(args: Args) -> None:
             cmd_queue,
             resources.stop_event,
             j3_csv_path,
+            resources.feedback_trace_shared,
+            resources.feedback_trace_lock,
             name="yam-leader-control",
         )
     )
@@ -962,6 +1130,8 @@ def run_leader(args: Args) -> None:
             resources.feedback_time,
             resources.stop_event,
             io_rate,
+            resources.feedback_trace_shared,
+            resources.feedback_trace_lock,
         )
     except KeyboardInterrupt:
         pass

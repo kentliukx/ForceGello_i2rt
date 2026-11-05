@@ -235,6 +235,8 @@ class MotorChainRobot(Robot):
         self._command_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._state_condition = threading.Condition(self._state_lock)
+        # CAN feedback and new commands wake the gravity-compensation loop.
+        self._update_wakeup = getattr(motor_chain, "state_updated_event", None) or threading.Event()
         self._joint_state_generation = 0
         self._mcap_lock = threading.Lock()
         self._mcap_recorder: Optional[RobotMcapRecorder] = None
@@ -340,10 +342,13 @@ class MotorChainRobot(Robot):
             current_time = time.time()
             elapsed_time = current_time - last_time
 
+            # Clear before update so a command or CAN state arriving during the
+            # update remains set and triggers another pass immediately.
+            self._update_wakeup.clear()
             self.update()
             if not self.motor_chain.running:
                 raise RuntimeError(f"{self}: motor_chain_robot's motor chain is not running, exiting the robot server")
-            time.sleep(0.001)
+            self._update_wakeup.wait(timeout=0.001)
 
             iteration_count += 1
             if elapsed_time >= 10.0:
@@ -408,6 +413,12 @@ class MotorChainRobot(Robot):
                 self._commands.kd = self._grav_comp_kd.copy()
                 self._torque_command_deadline = None
             return copy.deepcopy(self._commands)
+
+    def _wake_update(self) -> None:
+        """Apply a new command promptly while retaining periodic gravity updates."""
+        wakeup = getattr(self, "_update_wakeup", None)
+        if wakeup is not None:
+            wakeup.set()
 
     def _update_joint_state(
         self,
@@ -642,8 +653,9 @@ class MotorChainRobot(Robot):
             self._commands.kp = self._kp
             self._commands.kd = self._kd
             self._commands.trace = trace
+        self._wake_update()
 
-    def command_joint_torques(self, torques: np.ndarray) -> None:
+    def command_joint_torques(self, torques: np.ndarray, trace: Optional[Dict[str, Any]] = None) -> None:
         """Apply joint torque feedforward; expire it after 100 ms without a new command."""
         torques = np.asarray(torques, dtype=float)
         if torques.shape != (len(self.motor_chain),) or not np.all(np.isfinite(torques)):
@@ -652,7 +664,9 @@ class MotorChainRobot(Robot):
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.torques = torques.copy()
             self._commands.kd = self._grav_comp_kd.copy()
+            self._commands.trace = trace
             self._torque_command_deadline = time.monotonic() + 0.1
+        self._wake_update()
 
     def command_joint_state(self, joint_state: Dict[str, Any]) -> None:
         """Command position and velocity targets in joint command space.
@@ -677,6 +691,7 @@ class MotorChainRobot(Robot):
             self._commands.kd = kd
             self._commands.trace = joint_state.get("trace")
             self._torque_command_deadline = None
+        self._wake_update()
 
     def zero_torque_mode(self) -> None:
         logging.info(f"Entering zero_torque_mode for {self}")
@@ -685,6 +700,7 @@ class MotorChainRobot(Robot):
             self._kp = np.zeros(len(self.motor_chain))
             self._kd = np.zeros(len(self.motor_chain))
             self._torque_command_deadline = None
+        self._wake_update()
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         """Get the current observations of the robot.
@@ -763,6 +779,7 @@ class MotorChainRobot(Robot):
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.kd = self._grav_comp_kd.copy()
             self._torque_command_deadline = None
+        self._wake_update()
 
     def start_recording(self, save_dir: str) -> bool:
         """Start recording joint state data asynchronously."""

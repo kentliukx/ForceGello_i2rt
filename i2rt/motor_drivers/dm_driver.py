@@ -470,6 +470,7 @@ class DMChainCanInterface(MotorChain):
 
         self.state = None
         self.state_lock = threading.Lock()
+        self.state_updated_event = threading.Event()
         self._state_update_seq = 0
         self._latency_records: deque[Dict[str, int]] = deque(maxlen=20000)
         self._latency_lock = threading.Lock()
@@ -652,6 +653,7 @@ class DMChainCanInterface(MotorChain):
                         with self.same_bus_device_lock:
                             # assume the same bus device is a passive input device (no commands to send) for now.
                             self.same_bus_device_states = self.same_bus_device_driver.read_states()
+                    self.state_updated_event.set()
                     time.sleep(0.0005)  # yield GIL so other threads can acquire locks
                     self._rate_recorder.track()
                 except Exception as e:
@@ -736,12 +738,15 @@ class DMChainCanInterface(MotorChain):
             trace = commands[idx].trace
             if trace is not None:
                 trace_id = int(trace["trace_id"])
-                rx_ns = int(trace["leader_can_rx_ns"][idx]) if idx < len(trace["leader_can_rx_ns"]) else 0
+                rx_field = "follower_can_rx_ns" if "follower_can_rx_ns" in trace else "leader_can_rx_ns"
+                rx_times = trace[rx_field]
+                rx_ns = int(rx_times[idx]) if idx < len(rx_times) else 0
                 tx_ns = fd_back.tx_monotonic_ns
                 if rx_ns > 0 and tx_ns >= rx_ns and trace_id != self._last_logged_trace_id[idx]:
                     self._last_logged_trace_id[idx] = trace_id
-                    record = {key: int(value) for key, value in trace.items() if key != "leader_can_rx_ns"}
-                    record.update(joint=idx + 1, leader_can_rx_ns=rx_ns, follower_can_tx_ns=tx_ns)
+                    record = {key: int(value) for key, value in trace.items() if key != rx_field}
+                    tx_field = "leader_can_tx_ns" if rx_field == "follower_can_rx_ns" else "follower_can_tx_ns"
+                    record.update(joint=idx + 1, **{rx_field: rx_ns, tx_field: tx_ns})
                     with self._latency_lock:
                         self._latency_records.append(record)
             motor_feedback.append(fd_back)
