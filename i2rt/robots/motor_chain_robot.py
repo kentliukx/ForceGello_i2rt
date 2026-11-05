@@ -78,7 +78,7 @@ class MotorChainRobot(Robot):
         gripper_index: Optional[int] = None,  # Zero starting index: if you have a 6 dof arm and last one is gripper: 6
         kp: Union[float, List[float]] = 10.0,
         kd: Union[float, List[float]] = 1.0,
-        grav_comp_kd: Optional[np.ndarray] = None,  # per-joint MIT-mode kd, active only in grav-comp idle
+        grav_comp_kd: Optional[np.ndarray] = None,  # per-joint MIT-mode kd in gravity-compensation and torque modes
         coulomb_friction: Optional[
             np.ndarray
         ] = None,  # per-joint Coulomb friction (Nm); applied as coulomb_friction * sign(q_dot)
@@ -565,8 +565,10 @@ class MotorChainRobot(Robot):
             return {
                 "joint_pos": state.pos.copy(),
                 "joint_vel": state.vel.copy(),
+                "joint_eff_measured": state.eff.copy(),
                 "joint_eff_external": (state.eff - gravity_eff).copy(),
                 "joint_eff_pd_est": state.pd_torque_est.copy(),
+                "can_rx_monotonic_ns": state.can_rx_monotonic_ns.copy(),
             }
 
     def get_joint_pos(self) -> np.ndarray:

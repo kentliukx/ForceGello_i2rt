@@ -25,3 +25,12 @@ def test_launcher_passes_feedback_mode_and_gains_to_leader() -> None:
     assert cmd[cmd.index("--bilateral-beta") + 1] == "3.0"
     assert "--trace-latency" in cmd
     assert "--record-j3" in cmd
+
+
+def test_removed_bilateral_mode_is_rejected_before_hardware_start() -> None:
+    try:
+        bimanual_lead_follower.main(feedback_mode="bilateral")
+    except ValueError as error:
+        assert "feedback-mode" in str(error)
+    else:
+        raise AssertionError("removed feedback mode was accepted")

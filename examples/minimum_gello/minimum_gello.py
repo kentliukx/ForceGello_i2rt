@@ -37,7 +37,7 @@ _LEADER_IO_PERIOD_S = 0.002
 """Check the latest leader command and follower feedback about every 2 ms."""
 
 _FEEDBACK_TIMEOUT_S = 0.2
-_MAX_FEEDBACK_TORQUES_NM = np.array([10.0, 10.0, 10.0, 5.0, 5.0, 5.0])
+_LEADER_ANGLE_PREDICTION_S = 0.02
 _FOLLOWER_COMMAND_TIMEOUT_S = 0.5
 _LATENCY_TRACE_EVERY = 10
 _LATENCY_REPORT_PERIOD_S = 5.0
@@ -56,16 +56,21 @@ _LATENCY_FIELDS = (
 )
 
 
+def _leader_angle_target(follower_pos: np.ndarray, leader_vel: np.ndarray) -> np.ndarray:
+    """Predict the angle-mode target using the leader's current velocity in rad/s."""
+    return follower_pos + _LEADER_ANGLE_PREDICTION_S * leader_vel
+
+
 def _feedback_source(
     mode: Literal["angle", "torque"],
     leader_pos: np.ndarray,
-    follower_pos: np.ndarray,
+    target_pos: np.ndarray,
     follower_eff: np.ndarray,
     leader_kp: np.ndarray,
 ) -> np.ndarray:
     """Return the torque-like signal to reflect from one of the two feedback modes."""
     if mode == "angle":
-        return leader_kp * (leader_pos - follower_pos)
+        return leader_kp * (leader_pos - target_pos)
     if mode == "torque":
         return follower_eff
     raise ValueError(f"unsupported feedback mode: {mode}")
@@ -79,12 +84,18 @@ def _leader_feedback_torque(
     bilateral_alpha: float,
     bilateral_beta: float,
 ) -> np.ndarray:
-    """Apply speed attenuation, angle-error correction, and torque caps."""
+    """Apply speed attenuation and angle-error correction to the feedback torque."""
     with np.errstate(over="ignore"):
         speed_attenuation = 1.0 + bilateral_alpha * np.abs(follower_vel)
-        angle_correction = (2.0 / np.pi) * np.arctan(bilateral_beta * np.abs(angle_error))
+        # atan2(100 * |dq|, beta) equals atan((100 / beta) * |dq|) for beta > 0.
+        # beta=0 means no angle attenuation, including at exact alignment.
+        angle_correction = (
+            np.ones_like(angle_error)
+            if bilateral_beta == 0.0
+            else (2.0 / np.pi) * np.arctan2(100.0 * np.abs(angle_error), bilateral_beta)
+        )
         reflected_eff = -bilateral_kp * (feedback_signal * angle_correction / speed_attenuation)
-    return np.clip(reflected_eff, -_MAX_FEEDBACK_TORQUES_NM, _MAX_FEEDBACK_TORQUES_NM)
+    return reflected_eff
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +194,7 @@ class Args:
     server_port: int = DEFAULT_ROBOT_PORT
     can_channel: str = "can0"
     bilateral_kp: float = 0.0
-    bilateral_alpha: float = 1.0
+    bilateral_alpha: float = 0.0
     bilateral_beta: float = 1.0
     feedback_mode: Literal["angle", "torque"] = "angle"
     trace_latency: bool = False
@@ -206,7 +217,7 @@ class Resources:
     pos_shared: Optional[portal.SharedArray] = None
     vel_shared: Optional[portal.SharedArray] = None
     feedback_shared: Optional[portal.SharedArray] = None
-    pid_shared: Optional[portal.SharedArray] = None
+    measured_shared: Optional[portal.SharedArray] = None
     feedback_time: Optional[Any] = None
     stop_event: Optional[Any] = None
 
@@ -252,7 +263,7 @@ def _yam_polling_worker(
     pos_shared: "portal.SharedArray",
     vel_shared: Optional["portal.SharedArray"],
     feedback_shared: Optional["portal.SharedArray"],
-    pid_shared: Optional["portal.SharedArray"],
+    measured_shared: Optional["portal.SharedArray"],
     feedback_time: Any,
     n_dofs_value: Any,
     cmd_queue: Any,
@@ -323,23 +334,26 @@ def _yam_polling_worker(
                     feedback_obs = yam.get_force_feedback_observations()
                     pos = feedback_obs["joint_pos"]
                     vel = feedback_obs["joint_vel"]
+                    measured_eff = feedback_obs["joint_eff_measured"]
                     external_eff = feedback_obs["joint_eff_external"]
-                    pd_eff = feedback_obs["joint_eff_pd_est"]
                 else:
                     obs = yam.get_observations()
                     pos = yam.get_joint_pos()
                     vel = obs["joint_vel"]
+                    measured_eff = obs["joint_eff"]
                     external_eff = obs["joint_eff"] - yam.get_motor_torques()
-                    pd_eff = np.zeros_like(external_eff)
                 feedback_shared.array[: len(external_eff)] = external_eff
-                if pid_shared is not None:
-                    pid_shared.array[: len(pd_eff)] = pd_eff
+                if measured_shared is not None:
+                    measured_shared.array[: len(measured_eff)] = measured_eff
                 vel_shared.array[: len(vel)] = vel
             else:
                 pos = yam.get_joint_pos()
             pos_shared.array[: len(pos)] = pos
             if feedback_shared is not None:
-                feedback_time.value = time.monotonic()
+                if isinstance(yam, MotorChainRobot):
+                    feedback_time.value = np.min(feedback_obs["can_rx_monotonic_ns"][:6]) / 1e9
+                else:
+                    feedback_time.value = time.monotonic()
             rate.track()
         except Exception as e:
             logging.error(f"[{rate_name}] error: {e}")
@@ -392,13 +406,13 @@ def _leader_control_worker(
     pos_shared: "portal.SharedArray",
     vel_shared: "portal.SharedArray",
     feedback_shared: "portal.SharedArray",
-    pid_shared: "portal.SharedArray",
+    measured_shared: "portal.SharedArray",
     feedback_time: Any,
     cmd_queue: Any,
     stop_event: Any,
     j3_csv_path: Optional[Path],
 ) -> None:
-    """Owns the leader YAM hardware and runs the bilateral control
+    """Owns the leader YAM hardware and runs the feedback control
     loop. Reads the latest follower position and effort from shared memory
     (written by main's foreground web-IO loop) and pushes commands for the follower into
     ``cmd_queue`` (drained by main and forwarded over RPC). Never touches the
@@ -427,7 +441,13 @@ def _leader_control_worker(
             j3_file = j3_csv_path.open("w", newline="", buffering=1)
             j3_writer = csv.writer(j3_file)
             j3_writer.writerow(
-                ("monotonic_ns", "leader_angle_rad", "follower_angle_rad", "follower_pd_est_nm", "leader_feedback_nm")
+                (
+                    "monotonic_ns",
+                    "leader_angle_rad",
+                    "follower_angle_rad",
+                    "follower_motor_torque_nm",
+                    "leader_feedback_nm",
+                )
             )
             logging.info("J3 telemetry: %s", j3_csv_path)
         except OSError:
@@ -511,42 +531,45 @@ def _leader_control_worker(
             if not np.all(np.isfinite(current_joint_pos)) or not np.all(np.isfinite(current_joint_vel)):
                 robot.enter_gravity_comp_idle()
                 continue
+            now = time.monotonic()
+            feedback_fresh = now - feedback_time.value <= _FEEDBACK_TIMEOUT_S
+            follower_pos = pos_shared.array[:6].copy()
+            follower_vel = vel_shared.array[:6].copy()
             command_sequence += 1
+            command = {"pos": current_joint_pos.copy(), "vel": current_joint_vel.copy()}
             if args.trace_latency and command_sequence % _LATENCY_TRACE_EVERY == 0:
-                trace = {
+                command["trace"] = {
                     "trace_id": command_sequence,
                     "leader_can_rx_ns": current_rx_ns[:6].copy(),
                     "leader_read_ns": leader_read_ns,
                     "leader_queue_ns": time.monotonic_ns(),
                 }
-                _put_latest_command(
-                    cmd_queue, {"pos": current_joint_pos.copy(), "vel": current_joint_vel.copy(), "trace": trace}
-                )
-            else:
-                _put_latest_command(cmd_queue, {"pos": current_joint_pos.copy(), "vel": current_joint_vel.copy()})
-            now = time.monotonic()
-            feedback_fresh = now - feedback_time.value <= _FEEDBACK_TIMEOUT_S
-            follower_pos = pos_shared.array[:6].copy()
-            follower_pd = pid_shared.array[:6].copy() if j3_writer is not None else None
+            _put_latest_command(cmd_queue, command)
+            follower_measured_eff = measured_shared.array[:6].copy() if j3_writer is not None else None
             record_ns = time.monotonic_ns() if j3_writer is not None else 0
             leader_eff = np.zeros(6)
             if feedback_fresh:
                 external_eff = feedback_shared.array[:6].copy()
-                follower_vel = vel_shared.array[:6].copy()
                 if (
                     np.all(np.isfinite(current_joint_pos[:6]))
                     and np.all(np.isfinite(follower_pos))
                     and np.all(np.isfinite(external_eff))
                     and np.all(np.isfinite(follower_vel))
                 ):
+                    target_pos = (
+                        _leader_angle_target(follower_pos, current_joint_vel[:6])
+                        if args.feedback_mode == "angle"
+                        else follower_pos
+                    )
+                    angle_error = current_joint_pos[:6] - target_pos
                     feedback_source = _feedback_source(
-                        args.feedback_mode, current_joint_pos[:6], follower_pos, external_eff, leader_kp
+                        args.feedback_mode, current_joint_pos[:6], target_pos, external_eff, leader_kp
                     )
                     # Positive source means the leader is ahead or the follower pushes forward.
                     leader_eff = _leader_feedback_torque(
                         feedback_source,
                         follower_vel,
-                        current_joint_pos[:6] - follower_pos,
+                        angle_error,
                         args.bilateral_kp,
                         args.bilateral_alpha,
                         args.bilateral_beta,
@@ -559,14 +582,14 @@ def _leader_control_worker(
 
             if j3_writer is not None:
                 follower_angle = float(follower_pos[2]) if feedback_fresh else float("nan")
-                follower_pd_nm = float(follower_pd[2]) if feedback_fresh else float("nan")
+                follower_motor_nm = float(follower_measured_eff[2]) if feedback_fresh else float("nan")
                 try:
                     j3_writer.writerow(
                         (
                             record_ns,
                             float(current_joint_pos[2]),
                             follower_angle,
-                            follower_pd_nm,
+                            follower_motor_nm,
                             float(leader_eff[2]),
                         )
                     )
@@ -620,7 +643,7 @@ def _build_follower_server(
     pos_shared: "portal.SharedArray",
     vel_shared: "portal.SharedArray",
     feedback_shared: "portal.SharedArray",
-    pid_shared: "portal.SharedArray",
+    measured_shared: "portal.SharedArray",
     feedback_time: Any,
     cmd_queue: Any,
 ) -> portal.Server:
@@ -660,8 +683,8 @@ def _build_follower_server(
         return {
             "joint_pos": _get_pos(),
             "joint_vel": vel_shared.array[: n_dofs_value.value].copy(),
+            "joint_eff_measured": measured_shared.array[: n_dofs_value.value].copy(),
             "joint_eff_external": feedback_shared.array[: n_dofs_value.value].copy(),
-            "joint_eff_pd_est": pid_shared.array[: n_dofs_value.value].copy(),
             "sample_age_s": np.array(max(0.0, time.monotonic() - feedback_time.value)),
         }
 
@@ -681,7 +704,7 @@ def _run_leader_io_loop(
     pos_shared: "portal.SharedArray",
     vel_shared: "portal.SharedArray",
     feedback_shared: "portal.SharedArray",
-    pid_shared: "portal.SharedArray",
+    measured_shared: "portal.SharedArray",
     feedback_time: Any,
     stop_event: Any,
     io_rate: RateRecorder,
@@ -715,7 +738,7 @@ def _run_leader_io_loop(
             pos = np.asarray(obs["joint_pos"])
             vel = np.asarray(obs["joint_vel"])
             external_eff = np.asarray(obs["joint_eff_external"])
-            pd_eff = np.asarray(obs.get("joint_eff_pd_est", np.full_like(external_eff, np.nan)))
+            measured_eff = np.asarray(obs["joint_eff_measured"])
             sample_age = float(obs["sample_age_s"])
             if not np.all(np.isfinite(pos)):
                 raise ValueError("follower returned non-finite joint positions")
@@ -728,9 +751,9 @@ def _run_leader_io_loop(
                 feedback_time.value = 0.0
             else:
                 feedback_shared.array[: len(external_eff)] = external_eff
-                pid_shared.array[: len(pd_eff)] = pd_eff
+                measured_shared.array[: len(measured_eff)] = measured_eff
                 vel_shared.array[: len(vel)] = vel
-                feedback_time.value = time.monotonic()
+                feedback_time.value = time.monotonic() - sample_age - request_elapsed
             io_rate.track()
         except Exception as e:
             # Ride out a transient follower/network blip. Without this the exception escapes to
@@ -813,8 +836,8 @@ def cleanup(resources: Resources) -> None:
         resources.vel_shared.close()
     if resources.feedback_shared is not None:
         resources.feedback_shared.close()
-    if resources.pid_shared is not None:
-        resources.pid_shared.close()
+    if resources.measured_shared is not None:
+        resources.measured_shared.close()
     logging.info("Processes terminated.")
 
 
@@ -830,7 +853,7 @@ def run_follower(args: Args) -> None:
         pos_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
         vel_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
         feedback_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
-        pid_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
+        measured_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
         feedback_time=portal.mp.Value("d", 0.0),
         stop_event=portal.mp.Event(),
     )
@@ -849,7 +872,7 @@ def run_follower(args: Args) -> None:
             resources.pos_shared,
             resources.vel_shared,
             resources.feedback_shared,
-            resources.pid_shared,
+            resources.measured_shared,
             resources.feedback_time,
             n_dofs_value,
             cmd_queue,
@@ -867,7 +890,7 @@ def run_follower(args: Args) -> None:
         resources.pos_shared,
         resources.vel_shared,
         resources.feedback_shared,
-        resources.pid_shared,
+        resources.measured_shared,
         resources.feedback_time,
         cmd_queue,
     )
@@ -885,21 +908,29 @@ def run_follower(args: Args) -> None:
 
 def run_leader(args: Args) -> None:
     client_robot = ClientRobot(args.server_port, host=args.server_host)
-    initial_follower_obs = client_robot.get_observations()
-    initial_follower_pos = initial_follower_obs["joint_pos"]
+    try:
+        initial_follower_obs = client_robot.get_observations()
+        initial_follower_pos = initial_follower_obs["joint_pos"]
+    except Exception:
+        client_robot.close()
+        raise
     logging.info(f"Initial follower joint pos: {initial_follower_pos}")
 
     resources = Resources(
         pos_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
         vel_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
         feedback_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
-        pid_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
+        measured_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
         feedback_time=portal.mp.Value("d", 0.0),
         stop_event=portal.mp.Event(),
     )
     resources.pos_shared.array[:] = initial_follower_pos
     cmd_queue = portal.mp.Queue(maxsize=1)
-    j3_csv_path = Path("/tmp") / f"i2rt_j3_{args.can_channel}_{os.getpid()}.csv" if args.record_j3 else None
+    j3_csv_path = None
+    if args.record_j3:
+        j3_log_dir = Path(__file__).resolve().parents[1] / "bimanual_lead_follower" / "tests" / "log"
+        j3_log_dir.mkdir(parents=True, exist_ok=True)
+        j3_csv_path = j3_log_dir / f"i2rt_j3_{args.can_channel}_{time.time_ns()}_{os.getpid()}.csv"
 
     spawn = partial(_spawn_into, resources.processes)
     spawn(
@@ -909,7 +940,7 @@ def run_leader(args: Args) -> None:
             resources.pos_shared,
             resources.vel_shared,
             resources.feedback_shared,
-            resources.pid_shared,
+            resources.measured_shared,
             resources.feedback_time,
             cmd_queue,
             resources.stop_event,
@@ -927,7 +958,7 @@ def run_leader(args: Args) -> None:
             resources.pos_shared,
             resources.vel_shared,
             resources.feedback_shared,
-            resources.pid_shared,
+            resources.measured_shared,
             resources.feedback_time,
             resources.stop_event,
             io_rate,
@@ -944,7 +975,9 @@ def run_leader(args: Args) -> None:
             plot_script = Path(__file__).resolve().parents[1] / "bimanual_lead_follower" / "plot_j3.py"
             try:
                 subprocess.run(
-                    [sys.executable, str(plot_script), "--csv-path", str(j3_csv_path)], check=True, timeout=15
+                    [sys.executable, str(plot_script), "--csv-path", str(j3_csv_path), "--no-show"],
+                    check=True,
+                    timeout=15,
                 )
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 logging.exception("Could not plot J3 telemetry from %s", j3_csv_path)

@@ -58,7 +58,7 @@ def launch_gello_process(
     mode: str | None = None,
     server_port: int | None = None,
     bilateral_kp: float = 0.0,
-    bilateral_alpha: float = 1.0,
+    bilateral_alpha: float = 0.0,
     feedback_mode: Literal["angle", "torque"] = "angle",
     bilateral_beta: float = 1.0,
     trace_latency: bool = False,
@@ -149,7 +149,7 @@ def _request_shutdown(_signum: int, _frame: FrameType | None) -> None:
 
 def main(
     bilateral_kp: float = 0.0,
-    bilateral_alpha: float = 1.0,
+    bilateral_alpha: float = 0.0,
     feedback_mode: Literal["angle", "torque"] = "angle",
     bilateral_beta: float = 1.0,
     trace_latency: bool = False,

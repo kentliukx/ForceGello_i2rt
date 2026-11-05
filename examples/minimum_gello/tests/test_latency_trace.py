@@ -35,7 +35,7 @@ def test_trace_survives_rpc_serialization_and_follower_queue() -> None:
             SimpleNamespace(array=np.zeros(7)),
             SimpleNamespace(array=np.zeros(7)),
             SimpleNamespace(array=np.zeros(7)),
-            SimpleNamespace(array=np.zeros(7)),
+            SimpleNamespace(array=np.full(7, 2.5)),
             SimpleNamespace(value=time.monotonic()),
             command_queue,
         )
@@ -44,6 +44,7 @@ def test_trace_survives_rpc_serialization_and_follower_queue() -> None:
 
     np.testing.assert_array_equal(received["pos"], packet["pos"])
     np.testing.assert_array_equal(received["vel"], packet["vel"])
+    np.testing.assert_array_equal(server.methods["get_observations"]()["joint_eff_measured"], np.full(7, 2.5))
     np.testing.assert_array_equal(received["trace"]["leader_can_rx_ns"], trace["leader_can_rx_ns"])
     assert int(received["trace"]["follower_rpc_ns"]) > 0
 
@@ -67,20 +68,21 @@ def test_leader_io_attaches_send_stage_to_traced_command() -> None:
                 "joint_pos": np.zeros(7),
                 "joint_vel": np.zeros(7),
                 "joint_eff_external": np.zeros(7),
-                "joint_eff_pd_est": np.zeros(7),
+                "joint_eff_measured": np.full(7, 2.5),
                 "sample_age_s": np.array(0.0),
             }
 
     client = FakeClient()
     def shared() -> SimpleNamespace:
         return SimpleNamespace(array=np.zeros(7))
+    measured_shared = shared()
     minimum_gello._run_leader_io_loop(
         client,
         command_queue,
         shared(),
         shared(),
         shared(),
-        shared(),
+        measured_shared,
         SimpleNamespace(value=0.0),
         stop_event,
         SimpleNamespace(track=lambda: None),
@@ -88,4 +90,5 @@ def test_leader_io_attaches_send_stage_to_traced_command() -> None:
 
     assert client.sent is not None
     np.testing.assert_array_equal(client.sent["vel"], np.ones(7) * 0.2)
+    np.testing.assert_array_equal(measured_shared.array, np.full(7, 2.5))
     assert int(client.sent["trace"]["leader_io_ns"]) > 0

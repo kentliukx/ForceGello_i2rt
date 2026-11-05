@@ -1,7 +1,8 @@
-"""Render recorded right-arm J3 teleoperation data as a standalone SVG."""
+"""Render recorded right-arm J3 teleoperation data and open the figure."""
 
 import csv
 import math
+import webbrowser
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -11,9 +12,19 @@ import tyro
 _SERIES = (
     ("leader_angle_rad", "Leader J3 angle", "#2563eb"),
     ("follower_angle_rad", "Follower J3 angle", "#ea580c"),
-    ("follower_pd_est_nm", "Follower J3 PD estimate", "#16a34a"),
-    ("leader_feedback_nm", "Leader J3 extra feedback command", "#dc2626"),
+    ("follower_motor_torque_nm", "Follower J3 measured motor torque", "#16a34a"),
+    ("leader_feedback_nm", "Leader J3 feedback torque command", "#dc2626"),
 )
+_J3_LOG_DIR = Path(__file__).resolve().parent / "tests" / "log"
+
+
+def latest_j3_csv() -> Path:
+    """Find the newest right-arm J3 recording for direct IDE execution."""
+    recordings = _J3_LOG_DIR.glob("i2rt_j3_can_leader_r_*.csv")
+    latest = max(recordings, key=lambda path: path.stat().st_mtime_ns, default=None)
+    if latest is None:
+        raise FileNotFoundError(f"No right-arm J3 CSV found in {_J3_LOG_DIR}; run with --record-j3 first")
+    return latest
 
 
 def _limits(values: list[float]) -> tuple[float, float]:
@@ -35,7 +46,7 @@ def plot_j3_csv(csv_path: Path, output_path: Path | None = None) -> Path:
     samples: list[dict[str, float]] = []
     for row in rows:
         try:
-            sample = {key: float(row[key]) for key in ("monotonic_ns", *(series[0] for series in _SERIES))}
+            sample = {key: float(row[key]) for key in ("monotonic_ns", *(item[0] for item in _SERIES))}
         except (KeyError, TypeError, ValueError):
             continue  # Ignore a final partial line after an interrupted hardware run.
         if math.isfinite(sample["monotonic_ns"]):
@@ -60,7 +71,7 @@ def plot_j3_csv(csv_path: Path, output_path: Path | None = None) -> Path:
         ' .grid{stroke:#e5e7eb;stroke-width:1}</style>',
         '<text x="115" y="38" font-size="25" font-weight="bold">Right arm J3 teleoperation</text>',
         '<text x="115" y="64" font-size="14" fill="#4b5563">'
-        'PD torque is estimated from the commanded P/D setpoint and motor feedback.</text>',
+        'Follower motor torque is reported by CAN and includes gravity and PD response.</text>',
     ]
 
     for panel_top, panel_bottom, limits, title in (
@@ -123,8 +134,13 @@ def plot_j3_csv(csv_path: Path, output_path: Path | None = None) -> Path:
     return output_path
 
 
-def main(csv_path: Path, output_path: Path | None = None) -> None:
-    print(plot_j3_csv(csv_path, output_path))
+def main(csv_path: Path | None = None, output_path: Path | None = None, show: bool = True) -> None:
+    """Plot one CSV, or the newest right-arm recording when launched without arguments."""
+    source = csv_path if csv_path is not None else latest_j3_csv()
+    figure = plot_j3_csv(source, output_path)
+    print(f"J3 figure: {figure}")
+    if show and not webbrowser.open(figure.resolve().as_uri()):
+        print(f"Could not open a browser automatically. Open {figure} manually.")
 
 
 if __name__ == "__main__":

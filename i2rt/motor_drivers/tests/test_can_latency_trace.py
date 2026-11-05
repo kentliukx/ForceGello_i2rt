@@ -29,6 +29,21 @@ def test_can_timestamps_surround_send_and_receive() -> None:
     assert before_ns <= interface._last_tx_monotonic_ns <= interface._last_rx_monotonic_ns <= after_ns
 
 
+def test_can_receive_timestamp_is_recorded_without_latency_trace() -> None:
+    interface = CanInterface.__new__(CanInterface)
+    interface.bus = SimpleNamespace(
+        recv=lambda timeout: can.Message(arbitration_id=0x11, data=bytes(8), is_extended_id=False)
+    )
+    interface.use_buffered_reader = False
+    interface.trace_timestamps_enabled = False
+    interface._last_rx_monotonic_ns = 0
+    before_ns = time.monotonic_ns()
+
+    interface._receive_message()
+
+    assert before_ns <= interface._last_rx_monotonic_ns <= time.monotonic_ns()
+
+
 def test_driver_records_first_send_for_each_trace_and_joint() -> None:
     driver = DMChainCanInterface.__new__(DMChainCanInterface)
     driver.motor_list = [(1, "DM4340")]

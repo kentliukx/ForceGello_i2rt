@@ -16,6 +16,7 @@ def test_measured_effort_excludes_commanded_gravity_compensation() -> None:
         vel=np.array([0.4, -0.5]),
         eff=np.array([3.0, -1.0]),
         pd_torque_est=np.array([0.5, -0.6]),
+        can_rx_monotonic_ns=np.array([123, 456]),
     )
     robot.gravity_comp_factor = np.array([1.0, 1.1])
     robot._compute_gravity_compensation = lambda state: np.array([1.0, 2.0])
@@ -25,7 +26,9 @@ def test_measured_effort_excludes_commanded_gravity_compensation() -> None:
     np.testing.assert_allclose(obs["joint_eff_external"], [2.0, -3.2])
     np.testing.assert_allclose(obs["joint_pos"], [0.1, 0.2])
     np.testing.assert_allclose(obs["joint_vel"], [0.4, -0.5])
+    np.testing.assert_allclose(obs["joint_eff_measured"], [3.0, -1.0])
     np.testing.assert_allclose(obs["joint_eff_pd_est"], [0.5, -0.6])
+    np.testing.assert_array_equal(obs["can_rx_monotonic_ns"], [123, 456])
 
 
 def test_torque_feedback_command_uses_no_position_stiffness() -> None:
@@ -67,3 +70,4 @@ def test_joint_state_command_sends_velocity_target_to_motor() -> None:
     np.testing.assert_array_equal(robot._commands.vel, [0.3, -0.4])
     np.testing.assert_array_equal(robot._commands.kd, [2.0, 2.0])
     assert robot._commands.trace is trace
+    assert robot._torque_command_deadline is None
