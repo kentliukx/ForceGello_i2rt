@@ -46,3 +46,24 @@ def test_torque_feedback_command_uses_no_position_stiffness() -> None:
     np.testing.assert_allclose(expired.torques, [0.0, 0.0])
     np.testing.assert_allclose(expired.kp, [0.0, 0.0])
     np.testing.assert_allclose(expired.kd, [0.1, 0.2])
+
+
+def test_joint_state_command_sends_velocity_target_to_motor() -> None:
+    robot = cast(Any, MotorChainRobot.__new__(MotorChainRobot))
+    robot.motor_chain = [None, None]
+    robot._command_lock = threading.Lock()
+    robot._joint_limits = None
+    robot.remapper = SimpleNamespace(
+        to_robot_joint_pos_space=lambda values: values,
+        to_robot_joint_vel_space=lambda values: values,
+    )
+    robot._kp = np.array([80.0, 80.0])
+    robot._kd = np.array([2.0, 2.0])
+    trace = {"trace_id": 1}
+
+    robot.command_joint_state({"pos": np.array([0.1, -0.2]), "vel": np.array([0.3, -0.4]), "trace": trace})
+
+    np.testing.assert_array_equal(robot._commands.pos, [0.1, -0.2])
+    np.testing.assert_array_equal(robot._commands.vel, [0.3, -0.4])
+    np.testing.assert_array_equal(robot._commands.kd, [2.0, 2.0])
+    assert robot._commands.trace is trace

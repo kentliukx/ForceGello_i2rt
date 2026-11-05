@@ -136,13 +136,14 @@ class YAMLeaderRobot:
 
     def wait_for_info(
         self, last_generation: int, timeout_s: float
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]:
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]]:
         """Wait for a new arm state before issuing another follower target."""
-        snapshot = self._robot.wait_for_joint_pos_and_can_rx_ns(last_generation, timeout_s)
+        snapshot = self._robot.wait_for_joint_state_and_can_rx_ns(last_generation, timeout_s)
         if snapshot is None:
             return None
-        qpos, can_rx_ns, generation = snapshot
-        return (*self._format_info(qpos, can_rx_ns, time.monotonic_ns()), generation)
+        qpos, qvel, can_rx_ns, generation = snapshot
+        qpos_with_gripper, button, can_rx_ns, read_ns = self._format_info(qpos, can_rx_ns, time.monotonic_ns())
+        return qpos_with_gripper, np.concatenate([qvel, [0.0]]), button, can_rx_ns, read_ns, generation
 
     def _format_info(
         self, qpos: np.ndarray, can_rx_ns: np.ndarray, read_ns: int
@@ -304,11 +305,10 @@ def _yam_polling_worker(
                     break
             if cmd is not None:
                 if isinstance(cmd, dict):
-                    trace = dict(cmd["trace"], follower_worker_ns=time.monotonic_ns())
-                    if isinstance(yam, MotorChainRobot):
-                        yam.command_joint_pos(np.asarray(cmd["pos"]), trace=trace)
-                    else:
-                        yam.command_joint_pos(np.asarray(cmd["pos"]))
+                    state = {"pos": np.asarray(cmd["pos"]), "vel": np.asarray(cmd["vel"])}
+                    if "trace" in cmd:
+                        state["trace"] = dict(cmd["trace"], follower_worker_ns=time.monotonic_ns())
+                    yam.command_joint_state(state)
                 else:
                     yam.command_joint_pos(cmd)
                 last_command_time = time.monotonic()
@@ -445,7 +445,14 @@ def _leader_control_worker(
             if initial_info is None:
                 time.sleep(0.01)
                 continue
-            current_joint_pos, current_button, current_rx_ns, leader_read_ns, last_generation = initial_info
+            (
+                current_joint_pos,
+                current_joint_vel,
+                current_button,
+                current_rx_ns,
+                leader_read_ns,
+                last_generation,
+            ) = initial_info
             break
         except RuntimeError:
             time.sleep(0.05)
@@ -474,7 +481,7 @@ def _leader_control_worker(
             if synchronized and time.monotonic() - feedback_time.value > _FEEDBACK_TIMEOUT_S:
                 robot.enter_gravity_comp_idle()
             continue
-        current_joint_pos, current_button, current_rx_ns, leader_read_ns, last_generation = info
+        current_joint_pos, current_joint_vel, current_button, current_rx_ns, leader_read_ns, last_generation = info
         control_rate.track()
         if current_button[0] > 0.5:
             if not synchronized:
@@ -488,9 +495,22 @@ def _leader_control_worker(
             while current_button[0] > 0.5 and not stop_event.is_set():
                 info = robot.wait_for_info(last_generation, timeout_s=0.03)
                 if info is not None:
-                    current_joint_pos, current_button, current_rx_ns, leader_read_ns, last_generation = info
+                    (
+                        current_joint_pos,
+                        current_joint_vel,
+                        current_button,
+                        current_rx_ns,
+                        leader_read_ns,
+                        last_generation,
+                    ) = info
+            # Wait for a fresh arm sample after the button is released so the
+            # first velocity target cannot come from before the alignment move.
+            continue
 
         if synchronized:
+            if not np.all(np.isfinite(current_joint_pos)) or not np.all(np.isfinite(current_joint_vel)):
+                robot.enter_gravity_comp_idle()
+                continue
             command_sequence += 1
             if args.trace_latency and command_sequence % _LATENCY_TRACE_EVERY == 0:
                 trace = {
@@ -499,9 +519,11 @@ def _leader_control_worker(
                     "leader_read_ns": leader_read_ns,
                     "leader_queue_ns": time.monotonic_ns(),
                 }
-                _put_latest_command(cmd_queue, {"pos": current_joint_pos.copy(), "trace": trace})
+                _put_latest_command(
+                    cmd_queue, {"pos": current_joint_pos.copy(), "vel": current_joint_vel.copy(), "trace": trace}
+                )
             else:
-                _put_latest_command(cmd_queue, current_joint_pos)
+                _put_latest_command(cmd_queue, {"pos": current_joint_pos.copy(), "vel": current_joint_vel.copy()})
             now = time.monotonic()
             feedback_fresh = now - feedback_time.value <= _FEEDBACK_TIMEOUT_S
             follower_pos = pos_shared.array[:6].copy()
@@ -625,11 +647,14 @@ def _build_follower_server(
 
     def _cmd_state(state: Dict[str, Any]) -> None:
         key = "position" if "position" in state else "pos"
+        pos = np.asarray(state[key])
+        vel = np.asarray(state.get("vel", np.zeros_like(pos)))
+        if pos.shape != vel.shape or not np.all(np.isfinite(pos)) or not np.all(np.isfinite(vel)):
+            raise ValueError("joint position and velocity targets must have matching finite values")
+        packet = {"pos": pos, "vel": vel}
         if "trace" in state:
-            trace = dict(state["trace"], follower_rpc_ns=time.monotonic_ns())
-            _put_latest_command(cmd_queue, {"pos": np.asarray(state[key]), "trace": trace})
-        else:
-            _put_latest_command(cmd_queue, np.asarray(state[key]))
+            packet["trace"] = dict(state["trace"], follower_rpc_ns=time.monotonic_ns())
+        _put_latest_command(cmd_queue, packet)
 
     def _get_obs() -> Dict[str, np.ndarray]:
         return {
@@ -678,8 +703,10 @@ def _run_leader_io_loop(
         try:
             if cmd is not None:
                 if isinstance(cmd, dict):
-                    trace = dict(cmd["trace"], leader_io_ns=time.monotonic_ns())
-                    client_robot.command_joint_state({"pos": cmd["pos"], "trace": trace})
+                    state = {"pos": cmd["pos"], "vel": cmd["vel"]}
+                    if "trace" in cmd:
+                        state["trace"] = dict(cmd["trace"], leader_io_ns=time.monotonic_ns())
+                    client_robot.command_joint_state(state)
                 else:
                     client_robot.command_joint_pos(cmd)
             request_started = time.monotonic()

@@ -42,6 +42,27 @@ def test_wait_for_joint_state_wakes_on_new_generation() -> None:
     assert robot._joint_state.pos[0] == 0.2
 
 
+def test_position_and_velocity_snapshot_are_from_same_state() -> None:
+    robot = cast(Any, MotorChainRobot.__new__(MotorChainRobot))
+    robot._state_lock = threading.Lock()
+    robot._state_condition = threading.Condition(robot._state_lock)
+    robot._joint_state_generation = 8
+    robot._joint_state = SimpleNamespace(
+        pos=np.array([0.2, -0.3]), vel=np.array([0.4, -0.5]), can_rx_monotonic_ns=np.array([123, 456])
+    )
+
+    snapshot = robot.wait_for_joint_state_and_can_rx_ns(7, timeout_s=0.0)
+
+    assert snapshot is not None
+    pos, vel, can_rx_ns, generation = snapshot
+    assert generation == 8
+    np.testing.assert_array_equal(pos, [0.2, -0.3])
+    np.testing.assert_array_equal(vel, [0.4, -0.5])
+    np.testing.assert_array_equal(can_rx_ns, [123, 456])
+    vel[0] = 10.0
+    assert robot._joint_state.vel[0] == 0.4
+
+
 def test_robot_notifies_only_after_fresh_driver_feedback() -> None:
     robot = cast(Any, MotorChainRobot.__new__(MotorChainRobot))
     robot._state_lock = threading.Lock()

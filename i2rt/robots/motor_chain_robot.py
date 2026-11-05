@@ -595,6 +595,18 @@ class MotorChainRobot(Robot):
             state = self._joint_state
             return state.pos.copy(), state.can_rx_monotonic_ns.copy(), self._joint_state_generation
 
+    def wait_for_joint_state_and_can_rx_ns(
+        self, last_generation: int, timeout_s: float
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
+        """Snapshot positions, velocities (rad/s), and CAN times from one state update."""
+        with self._state_condition:
+            if not self._state_condition.wait_for(
+                lambda: self._joint_state_generation != last_generation, timeout=timeout_s
+            ):
+                return None
+            state = self._joint_state
+            return state.pos.copy(), state.vel.copy(), state.can_rx_monotonic_ns.copy(), self._joint_state_generation
+
     def _clip_robot_joint_pos_command(self, pos: np.ndarray) -> np.ndarray:
         """Clip the robot joint pos command to the joint limits. Do not clip the gripper pos.
         Args:
@@ -640,14 +652,19 @@ class MotorChainRobot(Robot):
             self._commands.kd = self._grav_comp_kd.copy()
             self._torque_command_deadline = time.monotonic() + 0.1
 
-    def command_joint_state(self, joint_state: Dict[str, np.ndarray]) -> None:
-        """Command the leader robot to a given state.
+    def command_joint_state(self, joint_state: Dict[str, Any]) -> None:
+        """Command position and velocity targets in joint command space.
 
         Args:
-            joint_state (Dict[str, np.ndarray]): The state to command the leader robot to.
+            joint_state: Position in radians, velocity in rad/s, and optional trace.
         """
-        pos = self._clip_robot_joint_pos_command(joint_state["pos"])
-        vel = joint_state["vel"]
+        pos = np.asarray(joint_state["pos"], dtype=float).copy()
+        vel = np.asarray(joint_state["vel"], dtype=float)
+        if pos.shape != (len(self.motor_chain),) or vel.shape != pos.shape:
+            raise ValueError("joint position and velocity targets must match the robot DOFs")
+        if not np.all(np.isfinite(pos)) or not np.all(np.isfinite(vel)):
+            raise ValueError("joint position and velocity targets must be finite")
+        pos = self._clip_robot_joint_pos_command(pos)
         kp = joint_state.get("kp", self._kp)
         kd = joint_state.get("kd", self._kd)
         with self._command_lock:
@@ -656,6 +673,7 @@ class MotorChainRobot(Robot):
             self._commands.vel = self.remapper.to_robot_joint_vel_space(vel)
             self._commands.kp = kp
             self._commands.kd = kd
+            self._commands.trace = joint_state.get("trace")
             self._torque_command_deadline = None
 
     def zero_torque_mode(self) -> None:

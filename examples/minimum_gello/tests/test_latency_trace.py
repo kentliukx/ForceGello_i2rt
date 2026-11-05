@@ -17,7 +17,7 @@ def test_trace_survives_rpc_serialization_and_follower_queue() -> None:
         "leader_queue_ns": 210,
         "leader_io_ns": 220,
     }
-    packet = {"pos": np.arange(7, dtype=float), "trace": trace}
+    packet = {"pos": np.arange(7, dtype=float), "vel": np.arange(7, dtype=float) * 0.1, "trace": trace}
     decoded = packlib.unpack(b"".join(packlib.pack((packet,))))[0]
     command_queue = queue.Queue(maxsize=1)
 
@@ -43,6 +43,7 @@ def test_trace_survives_rpc_serialization_and_follower_queue() -> None:
     received = command_queue.get_nowait()
 
     np.testing.assert_array_equal(received["pos"], packet["pos"])
+    np.testing.assert_array_equal(received["vel"], packet["vel"])
     np.testing.assert_array_equal(received["trace"]["leader_can_rx_ns"], trace["leader_can_rx_ns"])
     assert int(received["trace"]["follower_rpc_ns"]) > 0
 
@@ -50,7 +51,7 @@ def test_trace_survives_rpc_serialization_and_follower_queue() -> None:
 def test_leader_io_attaches_send_stage_to_traced_command() -> None:
     command_queue = queue.Queue(maxsize=1)
     trace = {"trace_id": 1, "leader_can_rx_ns": np.ones(6, dtype=np.int64)}
-    command_queue.put({"pos": np.zeros(7), "trace": trace})
+    command_queue.put({"pos": np.zeros(7), "vel": np.ones(7) * 0.2, "trace": trace})
     stop_event = SimpleNamespace(stopped=False)
     stop_event.is_set = lambda: stop_event.stopped
 
@@ -86,4 +87,5 @@ def test_leader_io_attaches_send_stage_to_traced_command() -> None:
     )
 
     assert client.sent is not None
+    np.testing.assert_array_equal(client.sent["vel"], np.ones(7) * 0.2)
     assert int(client.sent["trace"]["leader_io_ns"]) > 0
