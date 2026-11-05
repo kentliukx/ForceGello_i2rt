@@ -44,6 +44,83 @@ def test_can_receive_timestamp_is_recorded_without_latency_trace() -> None:
     assert before_ns <= interface._last_rx_monotonic_ns <= time.monotonic_ns()
 
 
+def test_can_request_skips_unrelated_frame_without_resending() -> None:
+    interface = CanInterface.__new__(CanInterface)
+    received = iter(
+        [
+            can.Message(arbitration_id=0x12, data=bytes(8), is_extended_id=False),
+            can.Message(arbitration_id=0x11, data=bytes(8), is_extended_id=False),
+        ]
+    )
+    sent: list[can.Message] = []
+    interface.bus = SimpleNamespace(send=sent.append, recv=lambda timeout: next(received, None))
+    interface.receive_mode = ReceiveMode.p16
+    interface.use_buffered_reader = False
+    interface.trace_timestamps_enabled = False
+
+    reply = interface._send_message_get_response(0x01, 1, [0] * 8)
+
+    assert reply.arbitration_id == 0x11
+    assert len(sent) == 1
+
+
+def test_new_command_is_accepted_during_can_exchange() -> None:
+    driver = DMChainCanInterface.__new__(DMChainCanInterface)
+    driver.motor_list = [(1, "DM4340")]
+    driver.command_lock = threading.RLock()
+    driver.state_lock = threading.Lock()
+    driver.commands = [MotorCmd(torque=0.0)]
+    driver.running = True
+    driver.enable_auto_recovery = False
+    driver.same_bus_device_driver = None
+    driver._state_update_seq = 0
+    driver._report_interval = 30.0
+    driver._update_absolute_positions = lambda _feedback: None
+
+    class Recorder:
+        def __enter__(self) -> "Recorder":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def track(self) -> None:
+            pass
+
+    driver._rate_recorder = Recorder()
+    started = threading.Event()
+    release = threading.Event()
+    accepted = threading.Event()
+
+    def exchange(_commands: list[MotorCmd]) -> list[SimpleNamespace]:
+        started.set()
+        if not release.wait(2.0):
+            raise AssertionError("test CAN exchange was not released")
+        driver.running = False
+        return [SimpleNamespace(error_code="0x1")]
+
+    driver._set_commands = exchange
+    control_thread = threading.Thread(target=driver._set_torques_and_update_state, daemon=True)
+    control_thread.start()
+    assert started.wait(1.0)
+
+    def update_command() -> None:
+        driver.set_commands(np.array([1.0]), get_state=False)
+        accepted.set()
+
+    update_thread = threading.Thread(target=update_command, daemon=True)
+    update_thread.start()
+    try:
+        assert accepted.wait(1.0), "command update blocked on the CAN round trip"
+    finally:
+        release.set()
+        update_thread.join(timeout=1.0)
+        control_thread.join(timeout=1.0)
+
+    assert not control_thread.is_alive()
+    assert driver.commands[0].torque == 1.0
+
+
 def test_driver_records_first_send_for_each_trace_and_joint() -> None:
     driver = DMChainCanInterface.__new__(DMChainCanInterface)
     driver.motor_list = [(1, "DM4340")]

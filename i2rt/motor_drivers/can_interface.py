@@ -43,30 +43,31 @@ class CanInterface:
     def _send_message_get_response(
         self, id: int, motor_id: int, data: List[int], max_retry: int = 5, expected_id: Optional[int] = None
     ) -> can.Message:
-        """Send a message over the CAN bus.
+        """Send a CAN request and wait for its matching reply.
 
         Args:
             id (int): The arbitration ID of the message.
             data (List[int]): The data payload of the message.
 
         Returns:
-            can.Message: The message that was sent.
+            can.Message: The matching motor or encoder reply.
         """
         message = can.Message(arbitration_id=id, data=data, is_extended_id=False)
+        if expected_id is None:
+            expected_id = self.receive_mode.get_receive_id(motor_id)
         for _ in range(max_retry):
             try:
                 # logging.info("Sending message: %s at %f", message, time.time())
                 self.bus.send(message)
                 if self.trace_timestamps_enabled:
                     self._last_tx_monotonic_ns = time.monotonic_ns()
-                response = self._receive_message(motor_id, timeout=0.01)
-                # logging.info("Received response: %s at %f", response, time.time())
-
-                if expected_id is None:
-                    expected_id = self.receive_mode.get_receive_id(motor_id)
-                if response and (expected_id == response.arbitration_id):
-                    return response
-                self.try_receive_message(id)
+                deadline = time.monotonic() + 0.01
+                while (remaining := deadline - time.monotonic()) > 0:
+                    response = self._receive_message(motor_id, timeout=remaining, supress_warning=True)
+                    if response is None:
+                        break
+                    if response.arbitration_id == expected_id:
+                        return response
             except (can.CanError, AssertionError) as e:
                 logging.warning(e)
                 logging.warning(
@@ -127,12 +128,12 @@ class CanInterface:
         Raises:
             AssertionError: If no message is received within the timeout.
         """
-        start_time = time.time()
-        while (time.time() - start_time) < timeout:
+        deadline = time.monotonic() + timeout
+        while (remaining := deadline - time.monotonic()) > 0:
             if self.use_buffered_reader:
-                message = self.buffered_reader.get_message(timeout=0.001)
+                message = self.buffered_reader.get_message(timeout=remaining)
             else:
-                message = self.bus.recv(timeout=0.001)
+                message = self.bus.recv(timeout=remaining)
             if message:
                 self._last_rx_monotonic_ns = time.monotonic_ns()
                 return message

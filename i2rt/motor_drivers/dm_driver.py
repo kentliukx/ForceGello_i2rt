@@ -616,37 +616,39 @@ class DMChainCanInterface(MotorChain):
                         max_step_time = 0.0
                         report_start_time = curr_time
 
-                    # Update state
+                    # Snapshot a complete command without holding the lock during
+                    # the blocking CAN round trip. New targets can be accepted while
+                    # the current cycle is in flight and used on the next cycle.
                     with self.command_lock:
-                        try:
-                            motor_feedback = self._set_commands(self.commands)
-                        except RuntimeError as e:
-                            if self.enable_auto_recovery and "Motor error detected" in str(e):
-                                logging.warning(f"Motor error in control loop, attempting recovery: {e}")
-                                if self._try_recover_motors():
-                                    logging.warning("Motor recovery successful, continuing control loop")
-                                    continue
-                                self.running = False
-                                raise
-                            raise
-
-                        errors = np.array([motor_feedback[i].error_code != "0x1" for i in range(len(motor_feedback))])
-                        if np.any(errors):
-                            if self.enable_auto_recovery:
-                                logging.warning(f"Motor errors detected in feedback: {errors}, attempting recovery")
-                                if self._try_recover_motors(motor_feedback):
-                                    logging.warning("Motor recovery successful, continuing control loop")
-                                    continue
+                        commands = self.commands
+                    try:
+                        motor_feedback = self._set_commands(commands)
+                    except RuntimeError as e:
+                        if self.enable_auto_recovery and "Motor error detected" in str(e):
+                            logging.warning(f"Motor error in control loop, attempting recovery: {e}")
+                            if self._try_recover_motors():
+                                logging.warning("Motor recovery successful, continuing control loop")
+                                continue
                             self.running = False
-                            logging.error(f"motor errors: {errors}")
-                            raise Exception(f"motor errors detected: {errors}, stopping control loop")
+                            raise
+                        raise
+
+                    errors = np.array([fb.error_code != "0x1" for fb in motor_feedback])
+                    if np.any(errors):
+                        if self.enable_auto_recovery:
+                            logging.warning(f"Motor errors detected in feedback: {errors}, attempting recovery")
+                            if self._try_recover_motors(motor_feedback):
+                                logging.warning("Motor recovery successful, continuing control loop")
+                                continue
+                        self.running = False
+                        logging.error(f"motor errors: {errors}")
+                        raise Exception(f"motor errors detected: {errors}, stopping control loop")
 
                     with self.state_lock:
                         self.state = motor_feedback
                         self._update_absolute_positions(motor_feedback)
                         self._state_update_seq += 1
                     if self.same_bus_device_driver is not None:
-                        time.sleep(0.001)
                         with self.same_bus_device_lock:
                             # assume the same bus device is a passive input device (no commands to send) for now.
                             self.same_bus_device_states = self.same_bus_device_driver.read_states()
