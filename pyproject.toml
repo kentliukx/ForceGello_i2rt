@@ -37,6 +37,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+collection = [
+    "opencv-python>=4.10",
+]
 dev = [
     "pyright>=1.1.408",
     "pytest>=8.4.0",

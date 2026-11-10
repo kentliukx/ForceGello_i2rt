@@ -1,5 +1,8 @@
 # Bimanual Lead-Follower System Setup
 
+For 60 Hz robot data, three 20 Hz cameras, and independent white-button trajectory recording,
+see [双臂数据采集](../bimanual_data_collection/README.md). Yellow-button teleoperation and force feedback are retained.
+
 This tutorial demonstrates how to set up a bimanual lead-follower system. This tutorial assumes you've followed the main README and finished setting up the environment.
 
 ## Required Hardware

@@ -101,6 +101,7 @@ class MotorChainRobot(Robot):
         joint_state_saver_factory: Optional[Callable[[], Any]] = None,
         set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
         enable_auto_recovery: Optional[bool] = None,  # None: inherit motor_chain's setting; True/False: override it
+        background_control: bool = True,  # False: caller owns refresh_state(), command_*(), update() timing
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -253,13 +254,19 @@ class MotorChainRobot(Robot):
         self._check_current_qpos_in_joint_limits()
 
         self._last_motor_torques: Optional[np.ndarray] = None
+        self._last_gravity_eff = np.zeros(len(motor_chain))
         self._stop_event = threading.Event()  # Add a stop event
-        self._server_thread = threading.Thread(target=self.start_server, name="robot_server")
-        self._server_thread.start()
+        self._server_thread = None
+        if background_control:
+            self._server_thread = threading.Thread(target=self.start_server, name="robot_server")
+            self._server_thread.start()
 
         if not zero_gravity_mode:
             # set current qpos as target pos with the default PD parameters
             self.command_joint_pos(self._joint_state.pos)
+        if not background_control:
+            # Prime the CAN command buffer without starting another gravity/control loop.
+            self.update()
 
     def __repr__(self) -> str:
         return f"MotorChainRobot(arm_type={self._arm_type}, gripper_type={self._gripper_type}, motor_chain={self.motor_chain})"
@@ -363,6 +370,22 @@ class MotorChainRobot(Robot):
                 last_time = current_time
                 iteration_count = 0
 
+    def refresh_state(self) -> None:
+        """Read the latest CAN buffer without computing gravity or changing commands.
+
+        With background_control=False, call before computing commands, then call update()
+        to compute gravity and submit commands. The CAN send/receive thread is unchanged.
+        """
+        if not self.motor_chain.running:
+            raise RuntimeError(f"{self}: motor chain is not running")
+        with self._state_condition:
+            previous_seq = self._joint_state.state_update_seq
+            self._joint_state = self._motor_state_to_joint_state(self.motor_chain.read_states())
+            self._check_current_qpos_in_joint_limits()
+            if self._joint_state.state_update_seq == 0 or self._joint_state.state_update_seq != previous_seq:
+                self._joint_state_generation += 1
+                self._state_condition.notify_all()
+
     def update(self) -> None:
         """Update the robot.
 
@@ -371,10 +394,11 @@ class MotorChainRobot(Robot):
         joint_commands = self._snapshot_joint_commands()
         with self._state_lock:
             g = self._compute_gravity_compensation(self._joint_state)
+            self._last_gravity_eff = g * self.gravity_comp_factor
             friction_comp = (
                 self._coulomb_friction * np.sign(self._joint_state.vel) if self.use_coulomb_friction else 0.0
             )
-            motor_torques = joint_commands.torques + g * self.gravity_comp_factor + friction_comp
+            motor_torques = joint_commands.torques + self._last_gravity_eff + friction_comp
             motor_torques = np.clip(motor_torques, -self._clip_motor_torque, self._clip_motor_torque)
             self._last_motor_torques = motor_torques.copy()
 
@@ -568,16 +592,25 @@ class MotorChainRobot(Robot):
         """Return the last computed motor torques (gravity comp + any command torques)."""
         return self._last_motor_torques
 
-    def get_force_feedback_observations(self) -> Dict[str, np.ndarray]:
-        """Read measured effort and the gravity torque applied at the same joint state."""
+    def get_force_feedback_observations(self, use_applied_gravity: bool = False) -> Dict[str, np.ndarray]:
+        """Read effort residuals; optionally subtract the last submitted gravity term.
+
+        use_applied_gravity avoids extra gravity calculations between scheduled update()
+        calls, useful when the CAN state refresh rate exceeds the gravity control rate.
+        """
         with self._state_lock:
             state = self._joint_state
-            gravity_eff = self._compute_gravity_compensation(state) * self.gravity_comp_factor
+            gravity_eff = (
+                self._last_gravity_eff
+                if use_applied_gravity
+                else self._compute_gravity_compensation(state) * self.gravity_comp_factor
+            )
             return {
                 "joint_pos": state.pos.copy(),
                 "joint_vel": state.vel.copy(),
                 "joint_eff_measured": state.eff.copy(),
                 "joint_eff_external": (state.eff - gravity_eff).copy(),
+                "joint_eff_gravity": gravity_eff.copy(),
                 "joint_eff_pd_est": state.pd_torque_est.copy(),
                 "can_rx_monotonic_ns": state.can_rx_monotonic_ns.copy(),
             }
@@ -753,7 +786,8 @@ class MotorChainRobot(Robot):
         """Safely close the robot by setting all torques to zero."""
         # self.move_to_zero()
         self._stop_event.set()  # Signal the thread to stop
-        self._server_thread.join()  # Wait for the thread to finish
+        if self._server_thread is not None:
+            self._server_thread.join()  # Wait for the thread to finish
         try:
             self.motor_chain.close()
         finally:
