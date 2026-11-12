@@ -34,7 +34,7 @@ python examples/bimanual_data_collection/collect_data.py --list-cameras
 python examples/bimanual_data_collection/collect_data.py
 ```
 
-默认预设：`--control-hz 60 --camera-hz 20 --feedback-mode angle --bilateral-kp 1 --bilateral-alpha 0 --bilateral-beta 3`。
+默认预设：`--control-hz 60 --camera-hz 20 --feedback-mode angle --bilateral-kp 1 --bilateral-alpha 0 --bilateral-beta 5`。
 输出目录默认为 `data/demonstrations`；命令行参数仍可覆盖预设。`--bilateral-kp 0` 可关闭额外反馈。
 不要同时运行旧的 `bimanual_lead_follower` 或其他占用同一 CAN 接口的程序。
 默认四个 CAN 接口是 `can_leader_l/r`、`can_follower_l/r`；可以通过 `--left-leader-can` 等参数覆盖。
@@ -113,6 +113,13 @@ python examples/bimanual_data_collection/play.py --episode data/demonstrations/2
 
 默认循环播放第 1 段。MuJoCo 窗口展示左右**从臂实测姿态**和夹爪，另外打开
 `left_wrist`、`right_wrist`、`external` 三个相机窗口；各流按记录的单调时间戳同步。
+左臂的青色点、右臂的橙色点分别表示末端空间 Kp 控制器的**虚拟目标点**，不是力作用点。
+若末端受到估计外力 `F_ext`，点的位置满足 `F_cmd = Kp × (目标点 − TCP) = −F_ext`：
+从真实末端指向点的方向，就是控制器为抵消外力而输出的力方向。
+默认 `--cartesian-kp 100` N/m（1 N 对应 1 cm 位移），可调大刚度以缩短点的距离；显示距离最多 20 cm。
+估计使用记录的电机力矩减去重力补偿后的残差，经阻尼雅可比反推；其中仍有跟踪、摩擦和惯性影响，
+点的位置只是可视化，不代表真实接触位置或力传感器读数；它不会向机械臂发送控制命令。
+回放根据力学平衡关系估计 `F_ext`，并消去采集时的 `wrench_sign`；快速运动时残差中的惯性和摩擦会让估计偏离真实接触力。
 相机窗口获得焦点时，空格暂停/继续，`R` 从头播放，`Q` 或 `Esc` 退出；关闭 MuJoCo 窗口也会退出。
 可用 `--speed 0.5` 慢放或 `--no-loop` 播放一次。`--validate-only` 只检查数据和模型，不打开窗口。
 播放只读取磁盘数据，不连接 CAN。仿真中右臂基座位于左臂基座右侧 0.60 m（模型 -Y 方向）；

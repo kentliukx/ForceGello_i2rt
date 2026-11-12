@@ -23,10 +23,12 @@ import tyro
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from examples.bimanual_data_collection.export_implicitrdp import CartesianProjection
 from examples.bimanual_data_collection.recording import read_robot_stream
 from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
 
 CAMERAS = ("left_wrist", "right_wrist", "external")
+MAX_FORCE_DOT_OFFSET_M = 0.20
 
 
 @dataclass
@@ -34,6 +36,7 @@ class Args:
     episode: Path = REPO_ROOT / "data/demonstrations/1"
     speed: float = 1.0
     loop: bool = True
+    cartesian_kp: float = 200.0  # Virtual Cartesian stiffness in N/m (translation only).
     validate_only: bool = False  # Load data and build the model without opening any windows.
 
 
@@ -103,6 +106,14 @@ def build_scene(metadata: dict[str, Any]) -> tuple[mujoco.MjModel, mujoco.MjData
     for side, y in (("left", 0.3), ("right", -0.3)):
         mount = scene.worldbody.add_frame(name=f"{side}_mount", pos=[0, y, 0])
         scene.attach(mujoco.MjSpec.from_file(single_arm_xml), prefix=f"{side}_", frame=mount)
+        marker = scene.worldbody.add_body(name=f"{side}_force_dot", mocap=True)
+        marker.add_geom(
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=[0.015, 0, 0],
+            rgba=[0.0, 0.85, 1.0, 1.0] if side == "left" else [1.0, 0.25, 0.1, 1.0],
+            contype=0,
+            conaffinity=0,
+        )
     model = scene.compile()
     for side in ("left", "right"):
         for number in range(1, 8):
@@ -121,6 +132,30 @@ def set_robot_pose(model: mujoco.MjModel, data: mujoco.MjData, side: str, sample
         joint = model.joint(f"{side}_joint{number}")
         low, high = joint.range
         data.qpos[joint.qposadr[0]] = low + opening * (high - low)
+
+
+def set_force_dot(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    side: str,
+    sample: dict[str, Any],
+    projection: CartesianProjection,
+    cartesian_kp: float,
+) -> None:
+    """Show the virtual target whose Cartesian Kp force opposes the estimated external force."""
+    _, _, wrench_tcp = projection.project(sample)
+    site = data.site(f"{side}_grasp_site")
+    # At equilibrium, tau_measured - tau_gravity = -J.T @ force_on_robot.
+    # F_cmd = Kp * (target - TCP) = -force_on_robot; undo the recording's wrench_sign.
+    force_on_robot = -(site.xmat.reshape(3, 3) @ np.asarray(wrench_tcp[:3], dtype=float)) / projection.wrench_sign
+    offset = -force_on_robot / cartesian_kp
+    length = float(np.linalg.norm(offset))
+    if not np.isfinite(length):
+        raise ValueError(f"{side} estimated TCP force is not finite")
+    if length > MAX_FORCE_DOT_OFFSET_M:
+        offset *= MAX_FORCE_DOT_OFFSET_M / length
+    marker_id = model.body(f"{side}_force_dot").mocapid[0]
+    data.mocap_pos[marker_id] = site.xpos + offset
 
 
 def show_camera(episode: Path, name: str, row: dict[str, Any], elapsed_s: float, paused: bool) -> None:
@@ -203,9 +238,21 @@ def _send_latest(states: Any, state: tuple[int, float, bool]) -> None:
 def main(args: Args) -> None:
     if not math.isfinite(args.speed) or args.speed <= 0:
         raise ValueError("--speed must be finite and positive")
+    if not math.isfinite(args.cartesian_kp) or args.cartesian_kp <= 0:
+        raise ValueError("--cartesian-kp must be finite and positive (N/m)")
     episode = args.episode.expanduser().resolve()
     metadata, robots, cameras = load_episode(episode)
     model, data = build_scene(metadata)
+    cartesian = metadata.get("cartesian", {})
+    projections = {
+        side: CartesianProjection(
+            metadata["settings"]["arm"],
+            metadata["settings"]["follower_gripper"],
+            float(cartesian.get("damping", 0.01)),
+            float(cartesian.get("sign", 1.0)),
+        )
+        for side in robots
+    }
     duration_s = (int(metadata["end_monotonic_ns"]) - int(metadata["start_monotonic_ns"])) / 1e9
     print(f"Episode: {episode} ({duration_s:.2f}s)", flush=True)
     for side, (times, _) in robots.items():
@@ -215,6 +262,9 @@ def main(args: Args) -> None:
     if args.validate_only:
         for side, (_, rows) in robots.items():
             set_robot_pose(model, data, side, rows[0])
+        mujoco.mj_forward(model, data)
+        for side, (_, rows) in robots.items():
+            set_force_dot(model, data, side, rows[0], projections[side], args.cartesian_kp)
         mujoco.mj_forward(model, data)
         print("Episode and bimanual MuJoCo model OK", flush=True)
         return
@@ -280,6 +330,7 @@ def main(args: Args) -> None:
                 timestamp_ns = int(metadata["start_monotonic_ns"]) + round(elapsed_s * 1e9)
 
                 changed = False
+                current_rows = {}
                 for side, (times, rows) in robots.items():
                     index = _index_at(times, timestamp_ns)
                     if index != last_robot[side]:
@@ -287,8 +338,12 @@ def main(args: Args) -> None:
                             set_robot_pose(model, data, side, rows[index])
                         last_robot[side] = index
                         changed = True
+                    current_rows[side] = rows[index]
                 if changed:
                     with viewer.lock():
+                        mujoco.mj_forward(model, data)
+                        for side, sample in current_rows.items():
+                            set_force_dot(model, data, side, sample, projections[side], args.cartesian_kp)
                         mujoco.mj_forward(model, data)
                     viewer.sync()
                 _send_latest(states, (timestamp_ns, elapsed_s, paused))

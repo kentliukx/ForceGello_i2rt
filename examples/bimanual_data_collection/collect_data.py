@@ -59,7 +59,7 @@ class Args:
     feedback_mode: Literal["angle", "torque"] = "angle"
     bilateral_kp: float = 1.0
     bilateral_alpha: float = 0.0
-    bilateral_beta: float = 3.0
+    bilateral_beta: float = 5.0
     yellow_button_index: int = 0
     white_button_index: int = 1
     print_buttons: bool = False
