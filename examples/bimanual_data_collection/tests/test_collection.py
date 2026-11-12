@@ -274,13 +274,14 @@ def test_cartesian_projection_reconstructs_jacobian_effort_and_local_frame() -> 
     np.testing.assert_allclose(local, np.concatenate([rotation.T @ wrench[:3], rotation.T @ wrench[3:]]), atol=1e-5)
 
 
-def test_missing_or_aliased_devices_and_invalid_gains_are_rejected() -> None:
+def test_fixed_camera_assignment_and_invalid_rates_are_rejected() -> None:
+    assert validate(Args()) == {
+        "left_wrist": "realsense:135122075425",
+        "right_wrist": "realsense:135122079769",
+        "external": "realsense:036422060422",
+    }
     with pytest.raises(ValueError):
-        validate(Args())
-    with pytest.raises(ValueError):
-        validate(Args(left_wrist_camera="0", right_wrist_camera="0", external_camera="2"))
-    with pytest.raises(ValueError):
-        validate(Args(left_wrist_camera="0", right_wrist_camera="1", external_camera="2", control_hz=float("nan")))
+        validate(Args(control_hz=float("nan")))
 
 
 @pytest.mark.parametrize("overrun", [False, True])

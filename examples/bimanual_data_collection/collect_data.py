@@ -31,12 +31,17 @@ from examples.bimanual_data_collection.recording import (
 )
 
 
+# Fixed lab camera assignment; edit here if a camera is replaced or moved.
+CAMERA_DEVICES = {
+    "left_wrist": "realsense:135122079769",
+    "right_wrist": "realsense:135122075425",
+    "external": "realsense:036422060422",
+}
+
+
 @dataclass
 class Args:
     output: Path = Path("data/demonstrations")
-    left_wrist_camera: str = ""
-    right_wrist_camera: str = ""
-    external_camera: str = ""
     list_cameras: bool = False
     control_hz: float = 60.0  # Followers and recording; leaders run at five times this rate.
     camera_hz: float = 20.0
@@ -52,9 +57,9 @@ class Args:
     left_follower_can: str = "can_follower_l"
     right_follower_can: str = "can_follower_r"
     feedback_mode: Literal["angle", "torque"] = "angle"
-    bilateral_kp: float = 0.0
+    bilateral_kp: float = 1.0
     bilateral_alpha: float = 0.0
-    bilateral_beta: float = 1.0
+    bilateral_beta: float = 3.0
     yellow_button_index: int = 0
     white_button_index: int = 1
     print_buttons: bool = False
@@ -358,11 +363,7 @@ class RecordingSession:
 
 
 def validate(args: Args) -> dict[str, str]:
-    cameras = {
-        "left_wrist": args.left_wrist_camera,
-        "right_wrist": args.right_wrist_camera,
-        "external": args.external_camera,
-    }
+    cameras = dict(CAMERA_DEVICES)
     camera_ids = {
         str(Path(f"/dev/video{device}" if device.isdigit() else device).resolve())
         if not device.startswith("realsense:")
@@ -370,7 +371,7 @@ def validate(args: Args) -> dict[str, str]:
         for device in cameras.values()
     }
     if not all(cameras.values()) or len(camera_ids) != 3:
-        raise ValueError("specify three different cameras; use --list-cameras to enumerate devices")
+        raise ValueError("CAMERA_DEVICES must contain three distinct camera devices")
     for name in (
         "control_hz",
         "camera_hz",
@@ -425,7 +426,11 @@ def main(args: Args) -> None:
         text=True,
         check=False,
     ).stdout.strip()
-    metadata = {"settings": json.loads(json.dumps(asdict(args), default=str)), "git_revision": revision}
+    metadata = {
+        "settings": json.loads(json.dumps(asdict(args), default=str)),
+        "camera_devices": cameras,
+        "git_revision": revision,
+    }
     projections = {
         side: CartesianProjection(args.arm, args.follower_gripper, args.wrench_damping, args.wrench_sign)
         for side in ("left", "right")

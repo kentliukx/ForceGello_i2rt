@@ -13,6 +13,7 @@ from typing import Literal
 import tyro
 
 current_file_path = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(os.path.dirname(current_file_path))
 
 
 def check_can_interface(interface: str) -> bool:
@@ -65,10 +66,15 @@ def launch_gello_process(
     record_j3: bool = False,
 ) -> "subprocess.Popen[bytes] | None":
     """Launch a single gello process with given parameters"""
-    python_path = "python"
-    script_path = os.path.join(current_file_path, "..", "minimum_gello", "minimum_gello.py")
-
-    cmd = [python_path, os.path.expanduser(script_path), "--can_channel", can_channel, "--gripper", gripper]
+    cmd = [
+        sys.executable,
+        "-m",
+        "examples.minimum_gello.minimum_gello",
+        "--can_channel",
+        can_channel,
+        "--gripper",
+        gripper,
+    ]
 
     if mode:
         cmd.extend(["--mode", mode])
@@ -97,7 +103,7 @@ def launch_gello_process(
     print(f"Starting: {' '.join(cmd)}")
 
     try:
-        process = subprocess.Popen(cmd, start_new_session=True)
+        process = subprocess.Popen(cmd, cwd=repo_root, start_new_session=True)
         return process
     except Exception as e:
         print(f"Error starting process for {can_channel}: {e}")

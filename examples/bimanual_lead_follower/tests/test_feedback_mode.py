@@ -19,6 +19,8 @@ def test_launcher_passes_feedback_mode_and_gains_to_leader() -> None:
         )
 
     cmd = popen.call_args.args[0]
+    assert cmd[:3] == [bimanual_lead_follower.sys.executable, "-m", "examples.minimum_gello.minimum_gello"]
+    assert popen.call_args.kwargs["cwd"] == bimanual_lead_follower.repo_root
     assert cmd[cmd.index("--feedback-mode") + 1] == "torque"
     assert cmd[cmd.index("--bilateral-kp") + 1] == "2.0"
     assert cmd[cmd.index("--bilateral-alpha") + 1] == "0.5"

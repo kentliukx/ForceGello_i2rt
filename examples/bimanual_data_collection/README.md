@@ -16,30 +16,26 @@
 
 ## 启动
 
-在 i2rt 根目录、原来控制机械臂的 uv 环境中安装相机依赖：
+在 i2rt 根目录激活 ForceGello conda 环境。该环境需要 opencv-python 和 pyrealsense2：
 
 ```bash
-uv sync --extra collection
-uv run python examples/bimanual_data_collection/collect_data.py --list-cameras
+conda activate ForceGello
+python -m pip install "opencv-python>=4.10" pyrealsense2
+python examples/bimanual_data_collection/collect_data.py --list-cameras
 ```
 
-枚举只查看设备，不打开机械臂。USB 相机优先使用稳定的 `/dev/v4l/by-id/...` 路径，而不是重启后可能变化的编号。
-也支持 `realsense:序列号`（需另外安装 `pyrealsense2`）。相机型号和三个设备尚未确定时，不会猜测映射或自动打开任意相机。
-
-以下三个路径需要替换成真实设备：
+--list-cameras 只枚举设备，不打开机械臂。三台相机按序列号固定在
+[collect_data.py](collect_data.py) 的 CAMERA_DEVICES：左腕 D435 135122075425、
+右腕 D435 135122079769、外部 D415 036422060422。这些是 pyrealsense2 报出的序列号，
+与 `/dev/v4l/by-id` 名称里的 USB 序列号不同。更换相机或调整安装位置时修改此映射；
+录制的 metadata.json 也保存实际使用的映射。
 
 ```bash
-uv run python examples/bimanual_data_collection/collect_data.py \
-  --left-wrist-camera /dev/v4l/by-id/LEFT_WRIST \
-  --right-wrist-camera /dev/v4l/by-id/RIGHT_WRIST \
-  --external-camera /dev/v4l/by-id/TOP \
-  --output data/demonstrations \
-  --control-hz 60 --camera-hz 20 \
-  --feedback-mode angle \
-  --bilateral-kp 0.05 --bilateral-alpha 0 --bilateral-beta 1
+python examples/bimanual_data_collection/collect_data.py
 ```
 
-沿用之前双臂脚本的反馈模式和增益；示例值不是新的硬件标定。`bilateral_kp` 默认 0，表示额外反馈关闭。
+默认预设：`--control-hz 60 --camera-hz 20 --feedback-mode angle --bilateral-kp 1 --bilateral-alpha 0 --bilateral-beta 3`。
+输出目录默认为 `data/demonstrations`；命令行参数仍可覆盖预设。`--bilateral-kp 0` 可关闭额外反馈。
 不要同时运行旧的 `bimanual_lead_follower` 或其他占用同一 CAN 接口的程序。
 默认四个 CAN 接口是 `can_leader_l/r`、`can_follower_l/r`；可以通过 `--left-leader-can` 等参数覆盖。
 
@@ -104,6 +100,23 @@ for sample in read_robot_stream(Path("data/demonstrations/1/robot_left.pkl")):
 磁盘逐条写入，不在内存累计整段图像。停止录制后有短暂排空时间，按采样时间归入对应轨迹；队列溢出、
 相机断开或设备长时间无样本会终止采集并保存当前轨迹为 `interrupted`，不静默丢数据。
 正常结束保存为 `complete`。断电可能留下 `.partial`，已写入的记录仍可恢复，但不能认为轨迹完整。
+
+## 回放采集数据
+
+在 ForceGello 环境、i2rt 根目录运行：
+
+```bash
+python examples/bimanual_data_collection/play.py
+# 播放其他轨迹：
+python examples/bimanual_data_collection/play.py --episode data/demonstrations/2
+```
+
+默认循环播放第 1 段。MuJoCo 窗口展示左右**从臂实测姿态**和夹爪，另外打开
+`left_wrist`、`right_wrist`、`external` 三个相机窗口；各流按记录的单调时间戳同步。
+相机窗口获得焦点时，空格暂停/继续，`R` 从头播放，`Q` 或 `Esc` 退出；关闭 MuJoCo 窗口也会退出。
+可用 `--speed 0.5` 慢放或 `--no-loop` 播放一次。`--validate-only` 只检查数据和模型，不打开窗口。
+播放只读取磁盘数据，不连接 CAN。仿真中右臂基座位于左臂基座右侧 0.60 m（模型 -Y 方向）；
+两臂朝向暂按平行处理，其他基座外参尚未标定。
 
 ## 导出 ImplicitRDP 格式
 

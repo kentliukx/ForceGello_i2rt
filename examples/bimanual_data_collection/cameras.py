@@ -31,6 +31,7 @@ def camera_worker(name: str, device: str, args: Any, packets: Any, stop: Any, or
     cv2.setNumThreads(1)
     capture = None
     pipeline = None
+    pipeline_started = False
     try:
         if device.startswith("realsense:"):
             import pyrealsense2 as rs
@@ -42,6 +43,7 @@ def camera_worker(name: str, device: str, args: Any, packets: Any, stop: Any, or
                 rs.stream.color, args.camera_width, args.camera_height, rs.format.bgr8, args.camera_capture_hz
             )
             pipeline.start(config)
+            pipeline_started = True
         else:
             source = int(device) if device.isdigit() else device
             capture = cv2.VideoCapture(source, cv2.CAP_V4L2)
@@ -106,5 +108,5 @@ def camera_worker(name: str, device: str, args: Any, packets: Any, stop: Any, or
     finally:
         if capture is not None:
             capture.release()
-        if pipeline is not None:
+        if pipeline_started:
             pipeline.stop()
