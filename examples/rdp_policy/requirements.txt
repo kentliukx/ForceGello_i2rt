@@ -1,0 +1,11 @@
+# Install into the existing i2rt environment; no ROS packages are needed.
+torch>=2.6
+torchvision>=0.21
+hydra-core>=1.3
+dill
+einops>=0.6
+diffusers
+timm
+peft
+zarr>=2.16,<3
+numcodecs>=0.11,<0.16
