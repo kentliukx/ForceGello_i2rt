@@ -68,17 +68,45 @@ def test_visual_latent_from_t_first_targets_the_command_at_t_plus_two() -> None:
     assert temporal["joint"][-1, 0] == 21
 
 
-def test_joint_commands_keep_position_and_velocity_units_and_gripper_convention() -> None:
-    action = np.arange(14, dtype=float) / 10
-    command = run.joint_command(action)
-    np.testing.assert_allclose(command["pos"], action[:7])
-    np.testing.assert_allclose(command["vel"][:6], action[7:13])
-    assert command["vel"][6] == 0
-    action[6] = 2
-    assert run.joint_command(action)["pos"][6] == 1
-    action[0] = np.nan
+def test_tcp_delta_ik_recovers_nearby_target_and_rejects_nonfinite() -> None:
+    from scipy.spatial.transform import Rotation
+    from examples.bimanual_data_collection.post_process_forcegello import ArmKinematics
+    from examples.rdp_policy.tcp_control import TCPDeltaIK, pose9_matrix
+    from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
+
+    xml = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310)
+    fk = ArmKinematics(Path(xml), 0.01, 1.0, 0.095, "right")
+    ik = TCPDeltaIK(str(xml))
+    observed = np.array([0.2, 0.6, 0.9, -0.8, 0.05, -0.1, 0.5])
+    desired = observed.copy()
+    desired[:6] += [0.01, -0.01, 0.015, -0.012, 0.008, 0.01]
+    current_pose = fk.pose(observed[:6])
+    target_pose = fk.pose(desired[:6])
+    r_current = pose9_matrix(current_pose)[:3, :3]
+    r_target = pose9_matrix(target_pose)[:3, :3]
+    action = np.r_[
+        target_pose[:3] - current_pose[:3],
+        Rotation.from_matrix(r_target @ r_current.T).as_euler('xyz'),
+        0.7,
+    ]
+    solved = ik.solve(action, observed, current_pose)
+    solved_pose = fk.pose(solved[:6])
+    np.testing.assert_allclose(solved_pose[:3], target_pose[:3], atol=1e-3)
+    np.testing.assert_allclose(
+        pose9_matrix(solved_pose)[:3, :3], r_target, atol=1e-2
+    )
+    assert solved[6] == pytest.approx(0.7)
     with pytest.raises(ValueError, match="finite"):
-        run.joint_command(action)
+        ik.solve(np.full(7, np.nan), observed, current_pose)
+
+
+def test_60hz_interpolation_derives_rad_per_second_velocity() -> None:
+    start = {"pos": np.zeros(7)}
+    target = {"pos": np.r_[np.full(6, 0.03), 0.6]}
+    command = run.interpolate_command(start, target, 1 / 3, 0.05)
+    np.testing.assert_allclose(command["pos"][:6], 0.01)
+    np.testing.assert_allclose(command["vel"][:6], 0.6)
+    assert command["vel"][6] == 0
 
 
 def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(monkeypatch: Any) -> None:
@@ -121,11 +149,15 @@ def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(
         extended_meta = {"right_robot_joint_pos": {"shape": [7]}}
 
         def decode(self, plan: Plan, temporal: dict) -> np.ndarray:
-            target = 10 * (temporal["right_robot_joint_pos"][-1, 0] + 1)
-            return np.concatenate([np.full(7, target), np.full(7, target / 10)])
+            target = 0.01 * (temporal["right_robot_joint_pos"][-1, 0] + 1)
+            return np.full(7, target)
 
     planner = SimpleNamespace(submit=lambda *args: None, latest=lambda: Plan(0, 0, np.zeros(1)), clear=lambda: None)
-    projection = SimpleNamespace(project=lambda state: {"right_robot_joint_pos": state["joint_pos"]})
+    projection = SimpleNamespace(project=lambda state: {
+        "right_robot_joint_pos": state["joint_pos"],
+        "right_robot_tcp_pose": np.zeros(9),
+    })
+    controller = SimpleNamespace(solve=lambda action, measured, pose: action.copy())
     monkeypatch.setattr(run.time, "monotonic_ns", lambda: now[0])
     run.control_loop(
         Robot(),
@@ -133,16 +165,18 @@ def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(
         planner,
         projection,
         SimpleNamespace(read=lambda *args, **kwargs: {}),
+        controller,
         args=run.Args(checkpoint=Path("unused"), max_steps=7, inference_hz=20),
         stop=stop,
         buttons=SimpleNamespace(consume_toggles=lambda since_ns: int(stop.step == 0)),
     )
     assert [step for step, _ in commands] == list(range(7))
     np.testing.assert_allclose(
-        [command["pos"][0] for _, command in commands], [0, 0, 0, 0, 20 / 3, 40 / 3, 20]
+        [command["pos"][0] for _, command in commands],
+        [0, 0, 0, 0, 0.02 / 3, 0.04 / 3, 0.02],
     )
     np.testing.assert_allclose(
-        [command["vel"][0] for _, command in commands], [0, 0, 0, 0, 2 / 3, 4 / 3, 2]
+        [command["vel"][0] for _, command in commands], [0, 0, 0, 0, 0.4, 0.4, 0.4],
     )
     np.testing.assert_allclose(np.diff(submitted_ns) / 1e9, 1 / 60, atol=1e-8)
 
@@ -206,7 +240,7 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
 
         def get_force_feedback_observations(self, use_applied_gravity: bool) -> dict:
             assert use_applied_gravity
-            return {"joint_pos": np.full(7, stop.step), "can_rx_monotonic_ns": np.full(7, now[0] - 100)}
+            return {"joint_pos": np.full(7, 0.01 * stop.step), "can_rx_monotonic_ns": np.full(7, now[0] - 100)}
 
         def command_joint_state(self, command: dict) -> None:
             events.append((stop.step, "command"))
@@ -228,7 +262,7 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
             force = temporal["right_robot_tcp_wrench"][:, 0]
             # The decoder observes only start..current and its last command targets current+1.
             np.testing.assert_array_equal(force, np.arange(plan.start_step, stop.step + 1))
-            return np.concatenate([np.full(7, force[-1] + 1), np.full(7, 0.5 * force[-1])])
+            return np.full(7, 0.01 * (force[-1] + 1))
 
     class Planner:
         pending = active = None
@@ -240,7 +274,7 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
             self.active = self.pending = None
 
         def submit(self, step: int, obs: dict) -> None:
-            np.testing.assert_array_equal(obs["right_robot_joint_pos"][:, 0], [step - 3, step])
+            np.testing.assert_allclose(obs["right_robot_joint_pos"][:, 0], [0.01 * (step - 3), 0.01 * step])
             self.pending = Plan(step, step - 5, np.zeros(1))
 
         def latest(self) -> Plan | None:
@@ -258,8 +292,10 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
         project=lambda state: {
             "right_robot_joint_pos": state["joint_pos"],
             "right_robot_tcp_wrench": np.full(6, stop.step),
+            "right_robot_tcp_pose": np.zeros(9),
         }
     )
+    controller = SimpleNamespace(solve=lambda action, measured, pose: action.copy())
     monkeypatch.setattr(run.time, "monotonic_ns", lambda: now[0])
     run.control_loop(
         Robot(),
@@ -267,6 +303,7 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
         Planner(),
         projection,
         SimpleNamespace(read=read_images),
+        controller,
         args=run.Args(checkpoint=Path("unused"), max_steps=steps, inference_hz=2, command_hz=20),
         stop=stop,
         buttons=SimpleNamespace(consume_toggles=lambda since_ns: int(stop.step in presses)),
@@ -286,15 +323,15 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
     if presses:
         assert by_step[12]["pos"][0] == 0
         assert by_step[13]["pos"][0] == 0  # observation 13 is decoded, but not sent yet
-        assert by_step[14]["pos"][0] == 14  # observation 13 targets control slot 14
-        assert by_step[14]["vel"][0] == 6.5
+        assert by_step[14]["pos"][0] == pytest.approx(0.14)  # observation 13 targets control slot 14
+        assert by_step[14]["vel"][0] == pytest.approx(0.14 / 0.05)
         assert by_step[14]["vel"][6] == 0
     if 15 in presses:
         assert not any(step in by_step for step in range(15, 20))
-        assert by_step[20]["pos"][0] == 20  # restart holds the new pose, not an old prediction
+        assert by_step[20]["pos"][0] == pytest.approx(0.20)  # restart holds the new pose
         assert by_step[21]["vel"][0] == 0
-        assert by_step[33]["pos"][0] == 20
-        assert by_step[34]["pos"][0] == 34
+        assert by_step[33]["pos"][0] == pytest.approx(0.20)
+        assert by_step[34]["pos"][0] == pytest.approx(0.34)
 
 
 def test_stale_robot_state_never_sends_policy_command() -> None:
@@ -310,6 +347,7 @@ def test_stale_robot_state_never_sends_policy_command() -> None:
         run.control_loop(
             robot,
             model,
+            None,
             None,
             None,
             None,

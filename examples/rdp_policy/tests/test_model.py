@@ -56,7 +56,7 @@ def checkpoint(tmp_path: Path) -> Path:
             normalizer[key] = SingleFieldLinearNormalizer.create_fit(
                 rng.normal(size=(64, meta.shape[0])).astype(np.float32)
             )
-    normalizer["action"] = SingleFieldLinearNormalizer.create_fit(rng.normal(size=(64, 14)).astype(np.float32))
+    normalizer["action"] = SingleFieldLinearNormalizer.create_fit(rng.normal(size=(64, 7)).astype(np.float32))
     normalizer["latent_action"] = SingleFieldLinearNormalizer.create_fit(rng.normal(size=(64, 16)).astype(np.float32))
     model.set_normalizer(normalizer)
     path = directory / "rdp/checkpoints/latest.ckpt"
@@ -81,7 +81,7 @@ def test_actual_checkpoint_latent_and_force_reactive_cpu_decoder(checkpoint: Pat
     action1 = model.decode(plan, temporal)
     temporal["right_robot_tcp_wrench"][-1] = 3
     action2 = model.decode(plan, temporal)
-    assert action1.shape == action2.shape == (14,)
+    assert action1.shape == action2.shape == (7,)
     assert np.all(np.isfinite(action2)) and not np.allclose(action1, action2)
     temporal["right_robot_joint_pos"][-1] = 1
     temporal["right_robot_joint_vel"][-1] = -1
@@ -99,7 +99,7 @@ def test_validate_only_never_opens_hardware(checkpoint: Path, monkeypatch: Any) 
 
 
 def test_wrong_arm_checkpoint_rejected_before_hardware(checkpoint: Path) -> None:
-    with pytest.raises(ValueError, match="arm/command key"):
+    with pytest.raises(ValueError, match="arm/TCP delta key"):
         RDPModel(checkpoint, RDP_ROOT, "cpu", "left")
     with pytest.raises(FileNotFoundError):
         resolve_at_checkpoint(checkpoint, "/missing/file", RDP_ROOT, Path("/missing/override"))

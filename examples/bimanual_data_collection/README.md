@@ -114,8 +114,11 @@ python examples/bimanual_data_collection/post_process_forcegello.py \
 
 默认将完整轨迹转换为 `data/forcegello_zarr/replay_buffer.zarr`，与启动目录无关；
 也可用 `--output-dir` 指定其他位置。输出默认是 60 Hz，包含双臂实测状态、
-三路 RGB 和与该帧对齐的主臂 `left_robot_command`、`right_robot_command`、`command`。
-Zarr 中不预先构造未来动作；各训练项目按自己的预测时距读取未来命令。
+三路 RGB 和与该帧对齐、实际提交给从臂的 `left_robot_command`、`right_robot_command`、`command`。
+每臂命令为 7 维位置目标，另有 `robot_command_valid`、命令的 `robot_tcp_command` 正运动学位姿，
+以及同帧 `robot_tcp_command_delta`：TCP 平移、XYZ 固定轴角和夹爪目标；idle 帧前六维位移为零。
+Zarr 中不预先构造未来动作；
+RDP 训练加载器用 t 时刻从臂实测 TCP 与 t+50 ms 从臂命令计算 7 维 TCP 位移和夹爪目标。
 现有输出不会被覆盖。
 
 ## 回放采集数据

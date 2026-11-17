@@ -90,10 +90,14 @@ class RDPModel:
         payload = torch.load(checkpoint, map_location="cpu", pickle_module=dill, weights_only=False)
         cfg = payload["cfg"]
         meta = cfg.task.shape_meta
-        if meta.action.get("space") != "joint" or list(meta.action.shape) != [14]:
-            raise ValueError("this runner requires a single-arm 14D joint pos7/vel7 RDP checkpoint")
-        if meta.action.get("key") != f"{side}_robot_command" or cfg.task.dataset.relative_action:
-            raise ValueError("checkpoint arm/command key must match --side and use absolute joint targets")
+        if meta.action.get("space") != "tcp_delta" or list(meta.action.shape) != [7]:
+            raise ValueError("this runner requires a newly trained 7D TCP delta + gripper RDP checkpoint")
+        if (
+            meta.action.get("key") != f"{side}_robot_tcp_delta"
+            or cfg.task.dataset.relative_action
+            or cfg.task.dataset.delta_action
+        ):
+            raise ValueError("checkpoint arm/TCP delta key must match --side")
         if "latent_diffusion" not in cfg.policy._target_ or not cfg.policy.at.use_rnn_decoder:
             raise ValueError("expected Latent Diffusion Policy with the reactive GRU AT decoder")
         path = resolve_at_checkpoint(checkpoint, str(cfg.at_load_dir), rdp_root, at_checkpoint)
@@ -160,8 +164,8 @@ class RDPModel:
             decoded = self.fast_at.get_action_from_latent_with_temporal_cond(latent, condition)
             # Decode only the observed prefix. Its last action predicts the next control target.
             action = self.fast_at.normalizer["action"].unnormalize(decoded)[0, -1].numpy().copy()
-        if action.shape != (14,) or not np.all(np.isfinite(action)):
-            raise ValueError("decoder must return a finite 14D joint command")
+        if action.shape != (7,) or not np.all(np.isfinite(action)):
+            raise ValueError("decoder must return a finite 7D TCP delta")
         return action
 
 

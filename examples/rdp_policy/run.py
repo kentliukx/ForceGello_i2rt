@@ -1,4 +1,4 @@
-"""Run a joint-action RDP checkpoint directly on YAM, without ROS."""
+"""Run a TCP-displacement RDP checkpoint directly on YAM, without ROS."""
 
 import math
 import multiprocessing as mp
@@ -23,6 +23,7 @@ from examples.bimanual_data_collection.cameras import camera_worker
 from examples.bimanual_data_collection.recording import PeriodicClock, request_shutdown
 from examples.rdp_policy.buttons import HandleButtons
 from examples.rdp_policy.runtime import History, RDPModel, SlowPlanner
+from examples.rdp_policy.tcp_control import TCPDeltaIK
 
 CAMERA_KEYS = {"external_img": "external", "left_wrist_img": "left_wrist", "right_wrist_img": "right_wrist"}
 STATE_SHAPES = {
@@ -226,21 +227,15 @@ class LiveImages:
         self.packets.close()
 
 
-def joint_command(action: np.ndarray) -> dict[str, np.ndarray]:
-    action = np.asarray(action, dtype=float)
-    if action.shape != (14,) or not np.all(np.isfinite(action)):
-        raise ValueError("expected finite pos7/vel7 action")
-    pos, vel = action[:7].copy(), action[7:].copy()
-    pos[6] = np.clip(pos[6], 0.0, 1.0)
-    vel[6] = 0.0
-    return {"pos": pos, "vel": vel}
-
-
 def interpolate_command(
-    start: dict[str, np.ndarray], target: dict[str, np.ndarray], fraction: float
+    start: dict[str, np.ndarray], target: dict[str, np.ndarray],
+    fraction: float, interval_s: float,
 ) -> dict[str, np.ndarray]:
     fraction = min(1.0, max(0.0, fraction))
-    return {key: start[key] + fraction * (target[key] - start[key]) for key in ("pos", "vel")}
+    displacement = target["pos"] - start["pos"]
+    velocity = displacement / interval_s
+    velocity[6] = 0.0  # The gripper controller uses a position target only.
+    return {"pos": start["pos"] + fraction * displacement, "vel": velocity}
 
 
 def control_loop(
@@ -249,6 +244,7 @@ def control_loop(
     planner: Any,
     projection: Any,
     images: Any,
+    controller: Any,
     *,
     args: Args,
     stop: Any,
@@ -266,6 +262,7 @@ def control_loop(
     last_policy_index = -1
     count = 0
     next_report_ns = started_ns
+    last_reject_ns = 0
     while not stop.is_set() and (args.max_steps is None or count < args.max_steps):
         if stop.wait(max(0.0, (clock.deadline_ns - time.monotonic_ns()) / 1e9)):
             break
@@ -295,7 +292,8 @@ def control_loop(
         else:
             if segment_target is not None:
                 command = interpolate_command(
-                    segment_start, segment_target, (index - segment_index) / command_divisor
+                    segment_start, segment_target,
+                    (index - segment_index) / command_divisor, 1.0 / args.control_hz,
                 )
             else:
                 command = {"pos": hold.copy(), "vel": np.zeros(7)}
@@ -305,8 +303,10 @@ def control_loop(
             if policy_tick:
                 frame_values = images.read(now_ns, required=True)
                 action = None
+                pose = None
                 if frame_values is not None:
                     observations = projection.project(state)
+                    pose = observations[f"{args.side}_robot_tcp_pose"]
                     observations.update(frame_values)
                     history.append(policy_index, observations)
                     if len(history.rows) >= model.past_steps and policy_index % divisor == 0:
@@ -330,9 +330,17 @@ def control_loop(
                         )
                     target = {"pos": hold.copy(), "vel": np.zeros(7)}
                 else:
-                    target = joint_command(action)
-                    active = True
-                    last_action_ns = now_ns
+                    try:
+                        target_pos = controller.solve(action, state["joint_pos"], pose)
+                    except ValueError as exc:
+                        target = {"pos": hold.copy(), "vel": np.zeros(7)}
+                        if now_ns - last_reject_ns >= 1_000_000_000:
+                            print(f"RDP TCP target rejected: {exc}", flush=True)
+                            last_reject_ns = now_ns
+                    else:
+                        target = {"pos": target_pos, "vel": np.zeros(7)}
+                        active = True
+                        last_action_ns = now_ns
                 segment_start, segment_target, segment_index = command, target, index
         count += 1
         if now_ns >= next_report_ns:
@@ -361,13 +369,13 @@ def main(args: Args) -> None:
     )
     specs = validate(args, model)
     print(
-        f"Loaded {args.side} joint RDP: observation={args.control_hz} Hz, "
-        f"command={args.command_hz} Hz, diffusion={args.inference_hz} Hz, action=14D"
+        f"Loaded {args.side} TCP-delta RDP: observation={args.control_hz} Hz, "
+        f"command={args.command_hz} Hz, diffusion={args.inference_hz} Hz, action=7D"
     )
     if args.validate_only:
         return
     import torch
-    from post_process_forcegello import ArmKinematics
+    from examples.bimanual_data_collection.post_process_forcegello import ArmKinematics
 
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
@@ -381,6 +389,7 @@ def main(args: Args) -> None:
         args.gripper_max_width_m,
         args.side,
     )
+    controller = TCPDeltaIK(str(combine_arm_and_gripper_xml(arm, gripper)))
     images = planner = robot = buttons = None
     previous_handler = signal.signal(signal.SIGTERM, request_shutdown)
     try:
@@ -396,6 +405,7 @@ def main(args: Args) -> None:
             planner,
             projection,
             images,
+            controller,
             args=args,
             stop=threading.Event(),
             buttons=buttons,

@@ -15,6 +15,7 @@ import numpy as np
 import tyro
 import zarr
 from numcodecs import Blosc
+from scipy.spatial.transform import Rotation
 
 SIDES = ("left", "right")
 CAMERAS = ("external", "left_wrist", "right_wrist")
@@ -57,6 +58,18 @@ class ArmKinematics:
         self.damping, self.wrench_sign = damping, wrench_sign
         self.gripper_max_width_m = gripper_max_width_m
 
+    def pose(self, joint_pos: np.ndarray) -> np.ndarray:
+        """Return grasp_site position and first two rotation columns in the arm base."""
+        q = np.asarray(joint_pos, dtype=np.float64)
+        if q.shape != (6,) or not np.all(np.isfinite(q)):
+            raise ValueError("TCP forward kinematics requires six finite joint angles")
+        self.data.qpos[self.qpos_indices] = q
+        mujoco.mj_forward(self.model, self.data)
+        rotation = self.data.site_xmat[self.site].reshape(3, 3)
+        return np.concatenate(
+            [self.data.site_xpos[self.site], rotation[:, :2].T.flatten()]
+        ).astype(np.float32)
+
     def project(self, obs: dict[str, Any]) -> dict[str, np.ndarray]:
         q = np.asarray(obs["joint_pos"], dtype=np.float64)
         dq = np.asarray(obs["joint_vel"], dtype=np.float64)
@@ -73,12 +86,8 @@ class ArmKinematics:
             )
         if not all(np.all(np.isfinite(value)) for value in (q, dq, measured, residual)):
             raise ValueError("non-finite follower state or effort")
-        self.data.qpos[self.qpos_indices] = q[:6]
-        mujoco.mj_forward(self.model, self.data)
+        pose = self.pose(q[:6])
         rotation = self.data.site_xmat[self.site].reshape(3, 3).copy()
-        pose = np.concatenate(
-            [self.data.site_xpos[self.site], rotation[:, :2].T.flatten()]
-        )
         linear = np.zeros((3, self.model.nv))
         angular = np.zeros_like(linear)
         mujoco.mj_jacSite(self.model, self.data, linear, angular, self.site)
@@ -92,7 +101,7 @@ class ArmKinematics:
         )
         width = np.array([q[6] * self.gripper_max_width_m])
         values = {
-            "tcp_pose": pose.astype(np.float32),
+            "tcp_pose": pose,
             "tcp_vel": (jacobian @ dq[:6]).astype(np.float32),
             "tcp_wrench": wrench_tcp.astype(np.float32),
             "gripper_width": width.astype(np.float32),
@@ -106,7 +115,7 @@ class ArmKinematics:
 
 
 def leader_target(packet: dict[str, Any]) -> np.ndarray:
-    """Pack the same pos7/vel7 layout used by the teleoperation follower command."""
+    """Keep the recorded leader state as an observation, separate from follower commands."""
     q = np.asarray(packet["leader_joint_pos_with_gripper"], dtype=np.float32)
     dq = np.asarray(packet["leader"]["joint_vel"], dtype=np.float32)
     if (
@@ -119,6 +128,39 @@ def leader_target(packet: dict[str, Any]) -> np.ndarray:
             "leader command requires finite q7 (arm + handle gripper) and six measured joint velocities"
         )
     return np.concatenate([q, dq, np.zeros(1, dtype=np.float32)])
+
+
+def follower_command(packet: dict[str, Any]) -> tuple[np.ndarray, np.uint8]:
+    """Read the submitted position target, or mark an idle frame as invalid."""
+    submitted = packet.get("command")
+    if submitted is None:
+        pos = packet["follower"]["joint_pos"]
+        valid = 0
+    else:
+        pos = submitted["pos"]
+        valid = 1
+    pos = np.asarray(pos, dtype=np.float32)
+    if pos.shape != (7,) or not np.all(np.isfinite(pos)):
+        raise ValueError("follower command requires seven finite joint positions")
+    return pos.copy(), np.uint8(valid)
+
+
+def tcp_command_delta(
+    observed_pose: np.ndarray, target_pose: np.ndarray, gripper: float, valid: bool
+) -> np.ndarray:
+    """Same-frame base-frame TCP command offset; inactive arms have zero motion."""
+    if not valid:
+        return np.array([0, 0, 0, 0, 0, 0, gripper], dtype=np.float32)
+    obs_x, obs_y = observed_pose[3:6], observed_pose[6:9]
+    tgt_x, tgt_y = target_pose[3:6], target_pose[6:9]
+    obs_rotation = np.column_stack((obs_x, obs_y, np.cross(obs_x, obs_y)))
+    tgt_rotation = np.column_stack((tgt_x, tgt_y, np.cross(tgt_x, tgt_y)))
+    relative = tgt_rotation @ obs_rotation.T
+    return np.r_[
+        target_pose[:3] - observed_pose[:3],
+        Rotation.from_matrix(relative).as_euler("xyz"),
+        gripper,
+    ].astype(np.float32)
 
 
 def preceding_index(
@@ -251,7 +293,7 @@ def main(
     robot_xml: Path | None = None,
     batch_size: int = 32,
 ) -> None:
-    """Export same-timestamp dual-arm observations and leader joint commands."""
+    """Export same-timestamp dual-arm observations and submitted follower targets."""
     if not all(
         math.isfinite(x) and x > 0
         for x in (hz, damping, gripper_max_width_m, max_robot_age_s, max_camera_age_s)
@@ -288,18 +330,19 @@ def main(
     writer = ReplayWriter(
         partial,
         {
-            "schema": "forcegello.bimanual_joint.v1",
+            "schema": "forcegello.bimanual_command.v1",
             "sample_hz": hz,
             "image_color": "RGB",
             "camera_order": list(CAMERAS),
             "image_shape": [image_height, image_width, 3],
-            "command": "same aligned timestamp as observation; leader pos7/vel7; per-arm 14D, global left14+right14; future training labels selected by dataset loader",
+            "command": "submitted follower position target at the same aligned timestamp; per-arm pos7, global left7+right7; idle entries copy measured follower position and have command_valid=0",
             "command_layout": [
                 "q1..q6",
-                "normalized handle gripper",
-                "dq1..dq6",
-                "gripper velocity=0",
+                "normalized gripper target",
             ],
+            "tcp_command": "FK of submitted follower q1..q6 in arm base; [x,y,z,R[:,0],R[:,1]], m and rotation columns",
+            "tcp_command_delta": "same-time target minus follower TCP observation in arm base; [dx,dy,dz,roll,pitch,yaw,absolute gripper]; R_delta=Rz(yaw) Ry(pitch) Rx(roll); idle motion is exactly zero",
+            "training_action": "future training action not stored; downstream loaders choose their prediction horizon and rebase target commands on the selected observation",
             "robot_order": list(SIDES),
             "pose": "each arm base frame; [x,y,z,R[:,0],R[:,1]], m and rotation columns",
             "velocity": "each arm base frame; [vx,vy,vz,wx,wy,wz], m/s and rad/s",
@@ -348,10 +391,17 @@ def main(
                 for side, index in zip(SIDES, indices):
                     packet = robots[side][index]
                     row.update(kinematics[side].project(packet["follower"]))
-                    command = leader_target(packet)
-                    row[f"{side}_leader_joint_pos"] = command[:7].copy()
-                    row[f"{side}_leader_joint_vel"] = command[7:].copy()
+                    leader = leader_target(packet)
+                    row[f"{side}_leader_joint_pos"] = leader[:7].copy()
+                    row[f"{side}_leader_joint_vel"] = leader[7:].copy()
+                    command, valid = follower_command(packet)
                     row[f"{side}_robot_command"] = command
+                    row[f"{side}_robot_command_valid"] = np.asarray(valid)
+                    target_pose = kinematics[side].pose(command[:6])
+                    row[f"{side}_robot_tcp_command"] = target_pose
+                    row[f"{side}_robot_tcp_command_delta"] = tcp_command_delta(
+                        row[f"{side}_robot_tcp_pose"], target_pose, command[6], bool(valid)
+                    )
                 row["command"] = np.concatenate(
                     [row[f"{side}_robot_command"] for side in SIDES]
                 )
