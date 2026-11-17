@@ -103,6 +103,21 @@ for sample in read_robot_stream(Path("data/demonstrations/1/robot_left.pkl")):
 相机断开或设备长时间无样本会终止采集并保存当前轨迹为 `interrupted`，不静默丢数据。
 正常结束保存为 `complete`。断电可能留下 `.partial`，已写入的记录仍可恢复，但不能认为轨迹完整。
 
+## 转换共享 Zarr
+
+在 i2rt 根目录运行，无需连接 CAN；需要 MuJoCo、OpenCV、Zarr 2 和 numcodecs：
+
+```bash
+python examples/bimanual_data_collection/post_process_forcegello.py \
+  --input-dir data/demonstrations
+```
+
+默认将完整轨迹转换为 `data/forcegello_zarr/replay_buffer.zarr`，与启动目录无关；
+也可用 `--output-dir` 指定其他位置。输出默认是 60 Hz，包含双臂实测状态、
+三路 RGB 和与该帧对齐的主臂 `left_robot_command`、`right_robot_command`、`command`。
+Zarr 中不预先构造未来动作；各训练项目按自己的预测时距读取未来命令。
+现有输出不会被覆盖。
+
 ## 回放采集数据
 
 在 ForceGello 环境、i2rt 根目录运行：
