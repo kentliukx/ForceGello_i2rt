@@ -33,10 +33,12 @@ GRU 只使用已经观测到的位置、速度和力历史，不填充未来反�
 按黄色按钮停用则直接进入纯重力补偿，不保持旧位置；仍沿用硬件配置的重力补偿阻尼。
 目标为 20 Hz，Linux 调度不提供硬实时保证；超时时钟槽会跳过，日志记录 `missed`。
 
-当前支持 `space=joint`、`key=right_robot_action`（或左臂对应字段）、输出 14 维的 RDP checkpoint。
+当前支持 `space=joint`、`key=right_robot_command`（或左臂对应字段）、输出 14 维的 RDP checkpoint。
 动作布局 `[q1..q6,gripper,dq1..dq6,0]`；夹爪位置保持归一化 [0,1]，夹爪速度强制为 0。
-该布局对应训练标签 `action[t] = 主臂[t+1]`；20 Hz 观测周期 t 解码，
-随后在 60 Hz 命令周期插值，约 50 ms 后到达该目标。
+该布局对应训练标签 `action[t] = 主臂[t+1]`。对二阶段训练时设置了
+`slow_obs_latency_steps: 1` 的新 checkpoint，t=0 ms 的慢视觉向量最早在
+t=50 ms 的快解码周期与新本体状态结合，预测 t=100 ms 的关节命令；
+60 Hz 命令周期在 50～100 ms 间插值到该目标。
 TCP 动作模型和双臂 28 维模型会在打开硬件前报错。
 
 ## 安装与启动

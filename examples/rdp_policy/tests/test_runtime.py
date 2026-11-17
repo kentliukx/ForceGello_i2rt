@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from examples.rdp_policy import run
-from examples.rdp_policy.runtime import History, Plan, SlowPlanner
+from examples.rdp_policy.runtime import History, Plan, RDPModel, SlowPlanner
 
 
 def test_history_matches_training_visual_stride_and_never_pads_future_force() -> None:
@@ -42,6 +42,30 @@ def test_history_visual_5hz_and_proprio_20hz_use_different_steps() -> None:
     np.testing.assert_array_equal(observations["joint"][:, 0], [38, 39])
     temporal = history.temporal(Plan(35, 12, np.zeros(1)), 64, ["joint"])
     np.testing.assert_array_equal(temporal["joint"][:, 0], np.arange(12, 40))
+
+
+def test_visual_latent_from_t_first_targets_the_command_at_t_plus_two() -> None:
+    import torch
+
+    model = RDPModel.__new__(RDPModel)
+    model.torch = torch
+    model.device = "cpu"
+    model.past_steps = 8
+    model.slow_obs_latency_steps = 1
+    model.policy = SimpleNamespace(
+        predict_action=lambda *args, **kwargs: {"action": torch.zeros(1, 1, 4)}
+    )
+    model.ratio = 4
+    plan = model.infer(20, {"joint": np.zeros((2, 7), dtype=np.float32)})
+    assert plan.anchor_step == 20
+    assert plan.start_step == 14
+    history = History(32)
+    for step in range(14, 22):
+        history.append(step, {"joint": np.full(7, step)})
+    temporal = history.temporal(plan, 32, ["joint"])
+    np.testing.assert_array_equal(temporal["joint"][:, 0], np.arange(14, 22))
+    # Decoder index 7 sees fast state 21 and predicts command time 22.
+    assert temporal["joint"][-1, 0] == 21
 
 
 def test_joint_commands_keep_position_and_velocity_units_and_gripper_convention() -> None:
@@ -115,10 +139,10 @@ def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(
     )
     assert [step for step, _ in commands] == list(range(7))
     np.testing.assert_allclose(
-        [command["pos"][0] for _, command in commands], [0, 10 / 3, 20 / 3, 10, 40 / 3, 50 / 3, 20]
+        [command["pos"][0] for _, command in commands], [0, 0, 0, 0, 20 / 3, 40 / 3, 20]
     )
     np.testing.assert_allclose(
-        [command["vel"][0] for _, command in commands], [0, 1 / 3, 2 / 3, 1, 4 / 3, 5 / 3, 2]
+        [command["vel"][0] for _, command in commands], [0, 0, 0, 0, 2 / 3, 4 / 3, 2]
     )
     np.testing.assert_allclose(np.diff(submitted_ns) / 1e9, 1 / 60, atol=1e-8)
 

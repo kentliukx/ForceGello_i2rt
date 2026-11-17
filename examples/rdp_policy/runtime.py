@@ -92,8 +92,8 @@ class RDPModel:
         meta = cfg.task.shape_meta
         if meta.action.get("space") != "joint" or list(meta.action.shape) != [14]:
             raise ValueError("this runner requires a single-arm 14D joint pos7/vel7 RDP checkpoint")
-        if meta.action.get("key") != f"{side}_robot_action" or cfg.task.dataset.relative_action:
-            raise ValueError("checkpoint arm/action key must match --side and use absolute joint targets")
+        if meta.action.get("key") != f"{side}_robot_command" or cfg.task.dataset.relative_action:
+            raise ValueError("checkpoint arm/command key must match --side and use absolute joint targets")
         if "latent_diffusion" not in cfg.policy._target_ or not cfg.policy.at.use_rnn_decoder:
             raise ValueError("expected Latent Diffusion Policy with the reactive GRU AT decoder")
         path = resolve_at_checkpoint(checkpoint, str(cfg.at_load_dir), rdp_root, at_checkpoint)
@@ -116,6 +116,9 @@ class RDPModel:
         self.n_obs_steps = int(cfg.n_obs_steps)
         self.ratio = int(cfg.dataset_obs_temporal_downsample_ratio)
         self.past_steps = self.n_obs_steps * self.ratio
+        self.slow_obs_latency_steps = int(cfg.task.dataset.get("slow_obs_latency_steps", 0))
+        if not 0 <= self.slow_obs_latency_steps < self.past_steps:
+            raise ValueError("checkpoint has invalid slow_obs_latency_steps")
         self.horizon = int(cfg.horizon)
         self.control_hz = float(cfg.task.get("control_hz", 60.0))
         visual_rates = {
@@ -141,7 +144,11 @@ class RDPModel:
             latent = result["action"][0, 0].detach().cpu().numpy().copy()
         if not np.all(np.isfinite(latent)):
             raise ValueError("non-finite diffusion latent")
-        return Plan(anchor_step, anchor_step - self.past_steps + 1, latent)
+        return Plan(
+            anchor_step,
+            anchor_step - self.past_steps + 1 + self.slow_obs_latency_steps,
+            latent,
+        )
 
     def decode(self, plan: Plan, temporal: dict[str, np.ndarray]) -> np.ndarray:
         tensors = {

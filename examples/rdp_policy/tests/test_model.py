@@ -72,7 +72,7 @@ def test_actual_checkpoint_latent_and_force_reactive_cpu_decoder(checkpoint: Pat
     model = RDPModel(checkpoint, RDP_ROOT, "cpu", "right", inference_steps=2)
     observations = {key: np.zeros((2, *meta["shape"]), dtype=np.float32) for key, meta in model.obs_meta.items()}
     plan = model.infer(30, observations)
-    assert plan.anchor_step == 30 and plan.start_step == 23
+    assert plan.anchor_step == 30 and plan.start_step == 24
     assert model.policy.num_inference_steps == 2
     assert model.visual_hz == 5 and model.control_hz == 20
     with pytest.raises(ValueError, match="visual sampling rate"):
@@ -99,7 +99,7 @@ def test_validate_only_never_opens_hardware(checkpoint: Path, monkeypatch: Any) 
 
 
 def test_wrong_arm_checkpoint_rejected_before_hardware(checkpoint: Path) -> None:
-    with pytest.raises(ValueError, match="arm/action key"):
+    with pytest.raises(ValueError, match="arm/command key"):
         RDPModel(checkpoint, RDP_ROOT, "cpu", "left")
     with pytest.raises(FileNotFoundError):
         resolve_at_checkpoint(checkpoint, "/missing/file", RDP_ROOT, Path("/missing/override"))

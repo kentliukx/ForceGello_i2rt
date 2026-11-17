@@ -314,6 +314,10 @@ def control_loop(
                             policy_index, history.observations(model.obs_meta, model.n_obs_steps, model.ratio)
                         )
                     plan = planner.latest()
+                    # A visual latent from observation t becomes available to
+                    # the fast proprio decoder no earlier than tick t + 1.
+                    if plan is not None and plan.anchor_step >= policy_index:
+                        plan = None
                     if plan is not None:
                         temporal = history.temporal(plan, model.horizon, model.extended_meta)
                         if temporal is not None:
@@ -386,7 +390,16 @@ def main(args: Args) -> None:
         robot = get_yam_robot(channel=channel, arm_type=arm, gripper_type=gripper, background_control=False)
         images = LiveImages(args, specs)
         planner = SlowPlanner(model)
-        control_loop(robot, model, planner, projection, images, args=args, stop=threading.Event(), buttons=buttons)
+        control_loop(
+            robot,
+            model,
+            planner,
+            projection,
+            images,
+            args=args,
+            stop=threading.Event(),
+            buttons=buttons,
+        )
     except KeyboardInterrupt:
         pass
     finally:
