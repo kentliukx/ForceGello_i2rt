@@ -54,6 +54,7 @@ class Args:
     right_wrist_camera: str = CAMERA_DEVICES["right_wrist"]
     left_wrist_camera: str = CAMERA_DEVICES["left_wrist"]
     control_hz: float = 20.0
+    command_hz: float = 60.0
     inference_hz: float = 5.0
     inference_steps: int = 8
     camera_hz: float = 5.0
@@ -75,6 +76,7 @@ class Args:
 def validate(args: Args, model: Any) -> dict[str, Any]:
     for name in (
         "control_hz",
+        "command_hz",
         "inference_hz",
         "camera_hz",
         "wrench_damping",
@@ -91,6 +93,9 @@ def validate(args: Args, model: Any) -> dict[str, Any]:
     divisor = args.control_hz / args.inference_hz
     if divisor < 1 or not math.isclose(divisor, round(divisor)):
         raise ValueError("control_hz must be an integer multiple of inference_hz")
+    command_divisor = args.command_hz / args.control_hz
+    if command_divisor < 1 or not math.isclose(command_divisor, round(command_divisor)):
+        raise ValueError("command_hz must be an integer multiple of control_hz")
     if not math.isclose(args.control_hz, model.control_hz):
         raise ValueError("control_hz must match the checkpoint training rate")
     visual_hz = getattr(model, "visual_hz", None)
@@ -231,6 +236,13 @@ def joint_command(action: np.ndarray) -> dict[str, np.ndarray]:
     return {"pos": pos, "vel": vel}
 
 
+def interpolate_command(
+    start: dict[str, np.ndarray], target: dict[str, np.ndarray], fraction: float
+) -> dict[str, np.ndarray]:
+    fraction = min(1.0, max(0.0, fraction))
+    return {key: start[key] + fraction * (target[key] - start[key]) for key in ("pos", "vel")}
+
+
 def control_loop(
     robot: Any,
     model: Any,
@@ -244,18 +256,23 @@ def control_loop(
 ) -> None:
     history = History(max(2 * model.horizon, model.past_steps))
     divisor = round(args.control_hz / args.inference_hz)
-    clock = PeriodicClock(args.control_hz, time.monotonic_ns())
+    command_divisor = round(args.command_hz / args.control_hz)
+    clock = PeriodicClock(args.command_hz, time.monotonic_ns())
     started_ns = last_action_ns = time.monotonic_ns()
     enabled = active = False
     hold = None
-    pending_command = None
-    pending_step = None
+    segment_start = segment_target = None
+    segment_index = None
+    last_policy_index = -1
     count = 0
     next_report_ns = started_ns
     while not stop.is_set() and (args.max_steps is None or count < args.max_steps):
         if stop.wait(max(0.0, (clock.deadline_ns - time.monotonic_ns()) / 1e9)):
             break
         index, _, missed = clock.consume(time.monotonic_ns())
+        policy_index = index // command_divisor
+        policy_tick = policy_index != last_policy_index
+        last_policy_index = policy_index
         robot.refresh_state()
         state = robot.get_force_feedback_observations(use_applied_gravity=True)
         now_ns = time.monotonic_ns()
@@ -267,8 +284,7 @@ def control_loop(
             history.rows.clear()
             planner.clear()
             active = False
-            pending_command = None
-            pending_step = None
+            segment_start = segment_target = segment_index = None
             last_action_ns = now_ns
             hold = state["joint_pos"].copy() if enabled else None
             print("Yellow: policy enabled" if enabled else "Yellow: gravity-compensation idle", flush=True)
@@ -277,39 +293,43 @@ def control_loop(
             robot.update()  # Clear PD targets before decoding/draining any queued camera frames.
             images.read(now_ns, required=False)
         else:
-            # The target decoded from observation t belongs to control slot t+1.
-            if pending_step == index:
-                command = pending_command
-                hold = command["pos"].copy()
+            if segment_target is not None:
+                command = interpolate_command(
+                    segment_start, segment_target, (index - segment_index) / command_divisor
+                )
             else:
                 command = {"pos": hold.copy(), "vel": np.zeros(7)}
-            pending_command = pending_step = None
+            hold = command["pos"].copy()
             robot.command_joint_state(command)
             robot.update()
-            frame_values = images.read(now_ns, required=True)
-            action = None
-            if frame_values is not None:
-                observations = projection.project(state)
-                observations.update(frame_values)
-                history.append(index, observations)
-                if len(history.rows) >= model.past_steps and index % divisor == 0:
-                    planner.submit(index, history.observations(model.obs_meta, model.n_obs_steps, model.ratio))
-                plan = planner.latest()
-                if plan is not None:
-                    temporal = history.temporal(plan, model.horizon, model.extended_meta)
-                    if temporal is not None:
-                        action = model.decode(plan, temporal)
-            if action is None:
-                timeout = args.policy_timeout_s if active else args.startup_timeout_s
-                if now_ns - last_action_ns > timeout * 1e9:
-                    raise TimeoutError(
-                        "no usable RDP plan; check inference speed, history continuity and model worker"
-                    )
-            else:
-                pending_command = joint_command(action)
-                pending_step = index + 1
-                active = True
-                last_action_ns = now_ns
+            if policy_tick:
+                frame_values = images.read(now_ns, required=True)
+                action = None
+                if frame_values is not None:
+                    observations = projection.project(state)
+                    observations.update(frame_values)
+                    history.append(policy_index, observations)
+                    if len(history.rows) >= model.past_steps and policy_index % divisor == 0:
+                        planner.submit(
+                            policy_index, history.observations(model.obs_meta, model.n_obs_steps, model.ratio)
+                        )
+                    plan = planner.latest()
+                    if plan is not None:
+                        temporal = history.temporal(plan, model.horizon, model.extended_meta)
+                        if temporal is not None:
+                            action = model.decode(plan, temporal)
+                if action is None:
+                    timeout = args.policy_timeout_s if active else args.startup_timeout_s
+                    if now_ns - last_action_ns > timeout * 1e9:
+                        raise TimeoutError(
+                            "no usable RDP plan; check inference speed, history continuity and model worker"
+                        )
+                    target = {"pos": hold.copy(), "vel": np.zeros(7)}
+                else:
+                    target = joint_command(action)
+                    active = True
+                    last_action_ns = now_ns
+                segment_start, segment_target, segment_index = command, target, index
         count += 1
         if now_ns >= next_report_ns:
             mode = "running" if enabled and active else "warming up" if enabled else "gravity idle; waiting for yellow"
@@ -336,7 +356,10 @@ def main(args: Args) -> None:
         inference_steps=args.inference_steps,
     )
     specs = validate(args, model)
-    print(f"Loaded {args.side} joint RDP: control={args.control_hz} Hz, diffusion={args.inference_hz} Hz, action=14D")
+    print(
+        f"Loaded {args.side} joint RDP: observation={args.control_hz} Hz, "
+        f"command={args.command_hz} Hz, diffusion={args.inference_hz} Hz, action=14D"
+    )
     if args.validate_only:
         return
     import torch

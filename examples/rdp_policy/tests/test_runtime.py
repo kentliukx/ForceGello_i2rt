@@ -57,6 +57,72 @@ def test_joint_commands_keep_position_and_velocity_units_and_gripper_convention(
         run.joint_command(action)
 
 
+def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(monkeypatch: Any) -> None:
+    now = [1_000_000_000]
+    commands, submitted_ns = [], []
+
+    class Stop:
+        step = -1
+
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, duration: float) -> bool:
+            now[0] += round(duration * 1e9)
+            self.step += 1
+            return False
+
+    stop = Stop()
+
+    class Robot:
+        def refresh_state(self) -> None:
+            pass
+
+        def get_force_feedback_observations(self, use_applied_gravity: bool) -> dict:
+            assert use_applied_gravity
+            return {
+                "joint_pos": np.full(7, stop.step // 3),
+                "can_rx_monotonic_ns": np.full(7, now[0] - 100),
+            }
+
+        def command_joint_state(self, command: dict) -> None:
+            commands.append((stop.step, command))
+
+        def update(self) -> None:
+            submitted_ns.append(now[0])
+
+    class Model:
+        horizon, past_steps, n_obs_steps, ratio = 32, 1, 1, 1
+        obs_meta = {"right_robot_joint_pos": {"shape": [7]}}
+        extended_meta = {"right_robot_joint_pos": {"shape": [7]}}
+
+        def decode(self, plan: Plan, temporal: dict) -> np.ndarray:
+            target = 10 * (temporal["right_robot_joint_pos"][-1, 0] + 1)
+            return np.concatenate([np.full(7, target), np.full(7, target / 10)])
+
+    planner = SimpleNamespace(submit=lambda *args: None, latest=lambda: Plan(0, 0, np.zeros(1)), clear=lambda: None)
+    projection = SimpleNamespace(project=lambda state: {"right_robot_joint_pos": state["joint_pos"]})
+    monkeypatch.setattr(run.time, "monotonic_ns", lambda: now[0])
+    run.control_loop(
+        Robot(),
+        Model(),
+        planner,
+        projection,
+        SimpleNamespace(read=lambda *args, **kwargs: {}),
+        args=run.Args(checkpoint=Path("unused"), max_steps=7, inference_hz=20),
+        stop=stop,
+        buttons=SimpleNamespace(consume_toggles=lambda since_ns: int(stop.step == 0)),
+    )
+    assert [step for step, _ in commands] == list(range(7))
+    np.testing.assert_allclose(
+        [command["pos"][0] for _, command in commands], [0, 10 / 3, 20 / 3, 10, 40 / 3, 50 / 3, 20]
+    )
+    np.testing.assert_allclose(
+        [command["vel"][0] for _, command in commands], [0, 1 / 3, 2 / 3, 1, 4 / 3, 5 / 3, 2]
+    )
+    np.testing.assert_allclose(np.diff(submitted_ns) / 1e9, 1 / 60, atol=1e-8)
+
+
 def test_slow_inference_is_asynchronous_and_replaces_pending_observations() -> None:
     entered, release, completed = threading.Event(), threading.Event(), threading.Event()
     calls = []
@@ -177,7 +243,7 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
         Planner(),
         projection,
         SimpleNamespace(read=read_images),
-        args=run.Args(checkpoint=Path("unused"), max_steps=steps, inference_hz=2),
+        args=run.Args(checkpoint=Path("unused"), max_steps=steps, inference_hz=2, command_hz=20),
         stop=stop,
         buttons=SimpleNamespace(consume_toggles=lambda since_ns: int(stop.step in presses)),
     )
@@ -246,6 +312,10 @@ def test_validate_opens_only_model_selected_camera_devices() -> None:
     with pytest.raises(ValueError, match="distinct"):
         run.validate(args, model)
     args.right_wrist_camera = "2"
+    args.command_hz = 55
+    with pytest.raises(ValueError, match="command_hz"):
+        run.validate(args, model)
+    args.command_hz = 60
     args.control_hz = 50
     with pytest.raises(ValueError):
         run.validate(args, model)
