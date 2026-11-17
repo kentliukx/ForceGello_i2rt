@@ -195,15 +195,16 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
     by_step = {step: command for step, _, command in commands}
     if presses:
         assert by_step[12]["pos"][0] == 0
-        assert by_step[13]["pos"][0] == 14  # compensate latent delay using current force
-        assert by_step[14]["pos"][0] == 15
-        assert by_step[14]["vel"][0] == 7
+        assert by_step[13]["pos"][0] == 0  # observation 13 is decoded, but not sent yet
+        assert by_step[14]["pos"][0] == 14  # observation 13 targets control slot 14
+        assert by_step[14]["vel"][0] == 6.5
         assert by_step[14]["vel"][6] == 0
     if 15 in presses:
         assert not any(step in by_step for step in range(15, 20))
         assert by_step[20]["pos"][0] == 20  # restart holds the new pose, not an old prediction
         assert by_step[21]["vel"][0] == 0
-        assert by_step[33]["pos"][0] == 34
+        assert by_step[33]["pos"][0] == 20
+        assert by_step[34]["pos"][0] == 34
 
 
 def test_stale_robot_state_never_sends_policy_command() -> None:
@@ -260,6 +261,7 @@ def test_live_camera_rgb_preprocessing_and_stale_detection(monkeypatch: Any) -> 
     images.specs = {key: {"shape": [3, 24, 32]} for key in ("external_img", "right_wrist_img")}
     images.packets = queue.Queue()
     images.frames = {}
+    images.future_packets = []
     images.workers = []
     bgr = np.zeros((24, 32, 3), dtype=np.uint8)
     bgr[:, :, 2] = 255
@@ -272,6 +274,11 @@ def test_live_camera_rgb_preprocessing_and_stale_detection(monkeypatch: Any) -> 
     for rgb in obs.values():
         assert rgb.shape == (3, 24, 32) and rgb.dtype == np.float32
         assert rgb[0, 0, 0] > 0.98 and rgb[2, 0, 0] < 0.02
+    images.packets.put({"kind": "camera", "camera": "right_wrist", "jpeg": jpeg.tobytes(), "monotonic_ns": now + 50_000_000})
+    assert images.read(now) is not None
+    assert images.frames["right_wrist_img"][0] == now
+    assert images.read(now + 50_000_000) is not None
+    assert images.frames["right_wrist_img"][0] == now + 50_000_000
     with pytest.raises(RuntimeError, match="camera data is stale"):
         images.read(now + 600_000_000)
     assert images.read(now + 600_000_000, required=False) is None

@@ -140,6 +140,7 @@ class LiveImages:
         self.packets = context.Queue(maxsize=64)
         self.stop = context.Event()
         self.frames: dict[str, tuple[int, np.ndarray]] = {}
+        self.future_packets: list[dict[str, Any]] = []
         origin_ns = time.monotonic_ns()
         self.workers = [
             context.Process(
@@ -174,14 +175,19 @@ class LiveImages:
     def _read(self, now_ns: int) -> dict[str, np.ndarray] | None:
         import cv2
 
+        packets, self.future_packets = self.future_packets, []
         while True:
             try:
-                packet = self.packets.get_nowait()
+                packets.append(self.packets.get_nowait())
             except queue.Empty:
                 break
+        for packet in packets:
             if packet["kind"] == "error":
                 raise RuntimeError(f"{packet['name']}: {packet['error']}")
             if packet["kind"] != "camera":
+                continue
+            if packet["monotonic_ns"] > now_ns:
+                self.future_packets.append(packet)
                 continue
             key = f"{packet['camera']}_img"
             _, height, width = self.specs[key]["shape"]
@@ -242,6 +248,8 @@ def control_loop(
     started_ns = last_action_ns = time.monotonic_ns()
     enabled = active = False
     hold = None
+    pending_command = None
+    pending_step = None
     count = 0
     next_report_ns = started_ns
     while not stop.is_set() and (args.max_steps is None or count < args.max_steps):
@@ -259,6 +267,8 @@ def control_loop(
             history.rows.clear()
             planner.clear()
             active = False
+            pending_command = None
+            pending_step = None
             last_action_ns = now_ns
             hold = state["joint_pos"].copy() if enabled else None
             print("Yellow: policy enabled" if enabled else "Yellow: gravity-compensation idle", flush=True)
@@ -267,6 +277,15 @@ def control_loop(
             robot.update()  # Clear PD targets before decoding/draining any queued camera frames.
             images.read(now_ns, required=False)
         else:
+            # The target decoded from observation t belongs to control slot t+1.
+            if pending_step == index:
+                command = pending_command
+                hold = command["pos"].copy()
+            else:
+                command = {"pos": hold.copy(), "vel": np.zeros(7)}
+            pending_command = pending_step = None
+            robot.command_joint_state(command)
+            robot.update()
             frame_values = images.read(now_ns, required=True)
             action = None
             if frame_values is not None:
@@ -286,14 +305,11 @@ def control_loop(
                     raise TimeoutError(
                         "no usable RDP plan; check inference speed, history continuity and model worker"
                     )
-                command = {"pos": hold.copy(), "vel": np.zeros(7)}
             else:
-                command = joint_command(action)
-                hold = command["pos"].copy()
+                pending_command = joint_command(action)
+                pending_step = index + 1
                 active = True
                 last_action_ns = now_ns
-            robot.command_joint_state(command)
-            robot.update()
         count += 1
         if now_ns >= next_report_ns:
             mode = "running" if enabled and active else "warming up" if enabled else "gravity idle; waiting for yellow"
