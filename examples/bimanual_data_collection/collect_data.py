@@ -20,6 +20,7 @@ import tyro
 # Allow `python examples/bimanual_data_collection/collect_data.py` as well as `python -m ...`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from examples.bimanual_data_collection.camera_devices import CAMERA_DEVICES
 from examples.bimanual_data_collection.cameras import camera_worker, list_cameras
 from examples.bimanual_data_collection.export_implicitrdp import CartesianProjection
 from examples.bimanual_data_collection.recording import (
@@ -29,14 +30,6 @@ from examples.bimanual_data_collection.recording import (
     request_shutdown,
     worker_signals,
 )
-
-
-# Fixed lab camera assignment; edit here if a camera is replaced or moved.
-CAMERA_DEVICES = {
-    "left_wrist": "realsense:135122079769",
-    "right_wrist": "realsense:135122075425",
-    "external": "realsense:036422060422",
-}
 
 
 @dataclass

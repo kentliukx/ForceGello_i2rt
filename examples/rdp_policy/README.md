@@ -55,18 +55,20 @@ uv run --no-sync python examples/rdp_policy/run.py \
   --device cpu --validate-only
 ```
 
-运行右臂策略（替换模型路径和两个相机路径）：
+运行右臂策略（替换模型路径；相机默认使用与数据采集相同的固定设备）：
 
 ```bash
 uv run --no-sync python examples/rdp_policy/run.py \
   --checkpoint ../RDP/data/outputs/YOUR_RUN/rdp/checkpoints/latest.ckpt \
   --can-channel can_follower_r \
-  --external-camera /dev/v4l/by-id/TOP \
-  --right-wrist-camera /dev/v4l/by-id/RIGHT_WRIST \
   --device cuda:0
 ```
 
-只打开 checkpoint 的 `obs` 实际使用的相机。默认需要右从臂、右手柄、顶部相机和右腕相机。
+相机编号统一写在 `examples/bimanual_data_collection/camera_devices.py`：顶部相机
+`realsense:036422060422`，右腕相机 `realsense:135122075425`，左腕相机
+`realsense:135122079769`。部署时只打开 checkpoint 的 `obs` 实际使用的相机；
+本右臂模型默认需要右从臂、右手柄、顶部相机和右腕相机。
+换相机时修改该文件，或通过 `--external-camera`、`--right-wrist-camera` 覆盖。
 不要同时运行占用相同 CAN 接口的采集器或遥操作程序。
 
 ## 夹爪初始化与黄色按钮

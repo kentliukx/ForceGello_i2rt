@@ -18,6 +18,7 @@ import tyro
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from examples.bimanual_data_collection.camera_devices import CAMERA_DEVICES
 from examples.bimanual_data_collection.cameras import camera_worker
 from examples.bimanual_data_collection.recording import PeriodicClock, request_shutdown
 from examples.rdp_policy.buttons import HandleButtons
@@ -49,9 +50,9 @@ class Args:
     button_timeout_s: float = 0.2
     arm: str = "yam"
     gripper: str = "linear_4310"
-    external_camera: str = ""
-    right_wrist_camera: str = ""
-    left_wrist_camera: str = ""
+    external_camera: str = CAMERA_DEVICES["external"]
+    right_wrist_camera: str = CAMERA_DEVICES["right_wrist"]
+    left_wrist_camera: str = CAMERA_DEVICES["left_wrist"]
     control_hz: float = 20.0
     inference_hz: float = 5.0
     inference_steps: int = 8
