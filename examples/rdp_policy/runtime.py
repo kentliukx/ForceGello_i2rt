@@ -65,7 +65,7 @@ def resolve_at_checkpoint(checkpoint: Path, configured: str, rdp_root: Path, ove
 
 
 class RDPModel:
-    """Slow diffusion on the requested device; an independent fast AT decoder on CPU."""
+    """Slow diffusion on the requested device; independent proprioceptive AT on CPU."""
 
     def __init__(
         self,
@@ -90,12 +90,17 @@ class RDPModel:
         payload = torch.load(checkpoint, map_location="cpu", pickle_module=dill, weights_only=False)
         cfg = payload["cfg"]
         meta = cfg.task.shape_meta
-        if meta.action.get("space") != "joint" or list(meta.action.shape) != [14]:
-            raise ValueError("this runner requires a single-arm 14D joint pos7/vel7 RDP checkpoint")
+        if meta.action.get("space") != "joint" or list(meta.action.shape) != [7]:
+            raise ValueError("this runner requires a single-arm 7D joint-position RDP checkpoint")
         if meta.action.get("key") != f"{side}_robot_command" or cfg.task.dataset.relative_action:
             raise ValueError("checkpoint arm/command key must match --side and use absolute joint targets")
         if "latent_diffusion" not in cfg.policy._target_ or not cfg.policy.at.use_rnn_decoder:
-            raise ValueError("expected Latent Diffusion Policy with the reactive GRU AT decoder")
+            raise ValueError("expected Latent Diffusion Policy with a proprioceptive GRU AT decoder")
+        expected_feedback = {f"{side}_robot_joint_pos", f"{side}_robot_joint_vel"}
+        if set(meta.extended_obs) != expected_feedback or any(
+            list(meta.extended_obs[key].shape) != [7] for key in expected_feedback
+        ):
+            raise ValueError("AT decoder must use only 7D joint position and velocity feedback")
         path = resolve_at_checkpoint(checkpoint, str(cfg.at_load_dir), rdp_root, at_checkpoint)
         cfg.policy.at.load_dir = str(path)
         cfg.policy.at.device = device
@@ -158,10 +163,10 @@ class RDPModel:
             condition = self.fast_at.get_temporal_cond(tensors)
             latent = self.torch.from_numpy(plan.latent).unsqueeze(0)
             decoded = self.fast_at.get_action_from_latent_with_temporal_cond(latent, condition)
-            # Decode only the observed prefix. Its last action predicts the next control target.
+            # The last observed joint state predicts the next 20 Hz command.
             action = self.fast_at.normalizer["action"].unnormalize(decoded)[0, -1].numpy().copy()
-        if action.shape != (14,) or not np.all(np.isfinite(action)):
-            raise ValueError("decoder must return a finite 14D joint command")
+        if action.shape != (7,) or not np.all(np.isfinite(action)):
+            raise ValueError("decoder must return a finite 7D joint command")
         return action
 
 

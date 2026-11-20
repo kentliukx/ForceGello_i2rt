@@ -11,7 +11,7 @@ pytest.importorskip("diffusers")
 pytest.importorskip("peft")
 
 from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from examples.rdp_policy import run
 from examples.rdp_policy.runtime import RDPModel, resolve_at_checkpoint
@@ -56,7 +56,7 @@ def checkpoint(tmp_path: Path) -> Path:
             normalizer[key] = SingleFieldLinearNormalizer.create_fit(
                 rng.normal(size=(64, meta.shape[0])).astype(np.float32)
             )
-    normalizer["action"] = SingleFieldLinearNormalizer.create_fit(rng.normal(size=(64, 14)).astype(np.float32))
+    normalizer["action"] = SingleFieldLinearNormalizer.create_fit(rng.normal(size=(64, 7)).astype(np.float32))
     normalizer["latent_action"] = SingleFieldLinearNormalizer.create_fit(rng.normal(size=(64, 16)).astype(np.float32))
     model.set_normalizer(normalizer)
     path = directory / "rdp/checkpoints/latest.ckpt"
@@ -68,7 +68,7 @@ def checkpoint(tmp_path: Path) -> Path:
     return path
 
 
-def test_actual_checkpoint_latent_and_force_reactive_cpu_decoder(checkpoint: Path) -> None:
+def test_actual_checkpoint_latent_and_proprioceptive_cpu_decoder(checkpoint: Path) -> None:
     model = RDPModel(checkpoint, RDP_ROOT, "cpu", "right", inference_steps=2)
     observations = {key: np.zeros((2, *meta["shape"]), dtype=np.float32) for key, meta in model.obs_meta.items()}
     plan = model.infer(30, observations)
@@ -78,15 +78,15 @@ def test_actual_checkpoint_latent_and_force_reactive_cpu_decoder(checkpoint: Pat
     with pytest.raises(ValueError, match="visual sampling rate"):
         run.validate(run.Args(checkpoint=checkpoint, device="cpu", camera_hz=20, validate_only=True), model)
     temporal = {key: np.zeros((11, *meta["shape"]), dtype=np.float32) for key, meta in model.extended_meta.items()}
+    assert set(temporal) == {"right_robot_joint_pos", "right_robot_joint_vel"}
     action1 = model.decode(plan, temporal)
-    temporal["right_robot_tcp_wrench"][-1] = 3
+    temporal["right_robot_joint_pos"][-1] = 3
     action2 = model.decode(plan, temporal)
-    assert action1.shape == action2.shape == (14,)
+    assert action1.shape == action2.shape == (7,)
     assert np.all(np.isfinite(action2)) and not np.allclose(action1, action2)
-    temporal["right_robot_joint_pos"][-1] = 1
     temporal["right_robot_joint_vel"][-1] = -1
     action3 = model.decode(plan, temporal)
-    assert not np.allclose(action2, action3)  # proprioception reaches the reactive decoder too
+    assert not np.allclose(action2, action3)  # joint speed still reaches the GRU decoder
     assert all(parameter.device.type == "cpu" for parameter in model.fast_at.decoder.parameters())
 
 
@@ -103,3 +103,15 @@ def test_wrong_arm_checkpoint_rejected_before_hardware(checkpoint: Path) -> None
         RDPModel(checkpoint, RDP_ROOT, "cpu", "left")
     with pytest.raises(FileNotFoundError):
         resolve_at_checkpoint(checkpoint, "/missing/file", RDP_ROOT, Path("/missing/override"))
+
+
+def test_force_conditioned_at_checkpoint_rejected(checkpoint: Path, tmp_path: Path) -> None:
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    with open_dict(payload["cfg"].task.shape_meta.extended_obs):
+        payload["cfg"].task.shape_meta.extended_obs.right_robot_tcp_wrench = {
+            "shape": [6], "type": "low_dim"
+        }
+    legacy_path = tmp_path / "legacy.ckpt"
+    torch.save(payload, legacy_path)
+    with pytest.raises(ValueError, match="only 7D joint position and velocity"):
+        RDPModel(legacy_path, RDP_ROOT, "cpu", "right")

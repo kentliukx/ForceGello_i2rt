@@ -106,19 +106,11 @@ class ArmKinematics:
 
 
 def leader_target(packet: dict[str, Any]) -> np.ndarray:
-    """Pack the same pos7/vel7 layout used by the teleoperation follower command."""
+    """Return the seven absolute leader targets: six joint angles and gripper opening."""
     q = np.asarray(packet["leader_joint_pos_with_gripper"], dtype=np.float32)
-    dq = np.asarray(packet["leader"]["joint_vel"], dtype=np.float32)
-    if (
-        q.shape != (7,)
-        or dq.shape != (6,)
-        or not np.all(np.isfinite(q))
-        or not np.all(np.isfinite(dq))
-    ):
-        raise ValueError(
-            "leader command requires finite q7 (arm + handle gripper) and six measured joint velocities"
-        )
-    return np.concatenate([q, dq, np.zeros(1, dtype=np.float32)])
+    if q.shape != (7,) or not np.all(np.isfinite(q)):
+        raise ValueError("leader command requires finite q7 (arm + handle gripper)")
+    return q.copy()
 
 
 def preceding_index(
@@ -288,17 +280,18 @@ def main(
     writer = ReplayWriter(
         partial,
         {
-            "schema": "forcegello.bimanual_joint.v1",
+            "schema": "forcegello.bimanual_joint.v2",
             "sample_hz": hz,
             "image_color": "RGB",
             "camera_order": list(CAMERAS),
             "image_shape": [image_height, image_width, 3],
-            "command": "same aligned timestamp as observation; leader pos7/vel7; per-arm 14D, global left14+right14; future training labels selected by dataset loader",
+            "command": (
+                "same aligned timestamp as observation; leader position7; "
+                "per-arm 7D, global left7+right7; future training labels selected by dataset loader"
+            ),
             "command_layout": [
                 "q1..q6",
                 "normalized handle gripper",
-                "dq1..dq6",
-                "gripper velocity=0",
             ],
             "robot_order": list(SIDES),
             "pose": "each arm base frame; [x,y,z,R[:,0],R[:,1]], m and rotation columns",
@@ -349,8 +342,11 @@ def main(
                     packet = robots[side][index]
                     row.update(kinematics[side].project(packet["follower"]))
                     command = leader_target(packet)
-                    row[f"{side}_leader_joint_pos"] = command[:7].copy()
-                    row[f"{side}_leader_joint_vel"] = command[7:].copy()
+                    row[f"{side}_leader_joint_pos"] = command.copy()
+                    leader_velocity = np.asarray(packet["leader"]["joint_vel"], dtype=np.float32)
+                    if leader_velocity.shape != (6,) or not np.all(np.isfinite(leader_velocity)):
+                        raise ValueError("leader velocity must contain six finite joint speeds")
+                    row[f"{side}_leader_joint_vel"] = np.append(leader_velocity, np.float32(0))
                     row[f"{side}_robot_command"] = command
                 row["command"] = np.concatenate(
                     [row[f"{side}_robot_command"] for side in SIDES]

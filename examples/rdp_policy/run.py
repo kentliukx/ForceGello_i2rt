@@ -71,6 +71,7 @@ class Args:
     policy_timeout_s: float = 1.0
     max_steps: int | None = None
     validate_only: bool = False  # Load/validate checkpoint without opening CAN or cameras.
+    debug_actions: bool = False  # Print the policy action and joint command once per second.
 
 
 def validate(args: Args, model: Any) -> dict[str, Any]:
@@ -226,13 +227,23 @@ class LiveImages:
         self.packets.close()
 
 
-def joint_command(action: np.ndarray) -> dict[str, np.ndarray]:
+def joint_command(action: np.ndarray, previous_pos: np.ndarray, control_hz: float) -> dict[str, np.ndarray]:
+    """Turn the next 20 Hz position target into an arm speed over one control step."""
     action = np.asarray(action, dtype=float)
-    if action.shape != (14,) or not np.all(np.isfinite(action)):
-        raise ValueError("expected finite pos7/vel7 action")
-    pos, vel = action[:7].copy(), action[7:].copy()
+    previous_pos = np.asarray(previous_pos, dtype=float)
+    if (
+        action.shape != (7,)
+        or previous_pos.shape != (7,)
+        or not np.all(np.isfinite(action))
+        or not np.all(np.isfinite(previous_pos))
+    ):
+        raise ValueError("expected finite 7D joint positions")
+    if not math.isfinite(control_hz) or control_hz <= 0:
+        raise ValueError("control_hz must be finite and positive")
+    pos = action.copy()
     pos[6] = np.clip(pos[6], 0.0, 1.0)
-    vel[6] = 0.0
+    vel = np.zeros(7)
+    vel[:6] = (pos[:6] - previous_pos[:6]) * control_hz
     return {"pos": pos, "vel": vel}
 
 
@@ -240,7 +251,10 @@ def interpolate_command(
     start: dict[str, np.ndarray], target: dict[str, np.ndarray], fraction: float
 ) -> dict[str, np.ndarray]:
     fraction = min(1.0, max(0.0, fraction))
-    return {key: start[key] + fraction * (target[key] - start[key]) for key in ("pos", "vel")}
+    return {
+        "pos": start["pos"] + fraction * (target["pos"] - start["pos"]),
+        "vel": target["vel"].copy(),
+    }
 
 
 def control_loop(
@@ -266,6 +280,7 @@ def control_loop(
     last_policy_index = -1
     count = 0
     next_report_ns = started_ns
+    next_action_report_ns = started_ns
     while not stop.is_set() and (args.max_steps is None or count < args.max_steps):
         if stop.wait(max(0.0, (clock.deadline_ns - time.monotonic_ns()) / 1e9)):
             break
@@ -305,6 +320,7 @@ def control_loop(
             if policy_tick:
                 frame_values = images.read(now_ns, required=True)
                 action = None
+                action_status = "camera unavailable"
                 if frame_values is not None:
                     observations = projection.project(state)
                     observations.update(frame_values)
@@ -314,14 +330,18 @@ def control_loop(
                             policy_index, history.observations(model.obs_meta, model.n_obs_steps, model.ratio)
                         )
                     plan = planner.latest()
+                    action_status = "no plan yet"
                     # A visual latent from observation t becomes available to
                     # the fast proprio decoder no earlier than tick t + 1.
                     if plan is not None and plan.anchor_step >= policy_index:
+                        action_status = "plan waiting for next observation"
                         plan = None
                     if plan is not None:
                         temporal = history.temporal(plan, model.horizon, model.extended_meta)
+                        action_status = "plan history unavailable"
                         if temporal is not None:
                             action = model.decode(plan, temporal)
+                            action_status = "decoded"
                 if action is None:
                     timeout = args.policy_timeout_s if active else args.startup_timeout_s
                     if now_ns - last_action_ns > timeout * 1e9:
@@ -330,9 +350,23 @@ def control_loop(
                         )
                     target = {"pos": hold.copy(), "vel": np.zeros(7)}
                 else:
-                    target = joint_command(action)
+                    target = joint_command(action, command["pos"], args.control_hz)
                     active = True
                     last_action_ns = now_ns
+                if args.debug_actions and now_ns >= next_action_report_ns:
+                    if action is not None:
+                        measured_error = np.max(np.abs(target["pos"][:6] - state["joint_pos"][:6]))
+                        print(
+                            f"RDP action: step={policy_index} status={action_status} "
+                            f"target_q={np.array2string(target['pos'][:6], precision=4)} "
+                            f"gripper={target['pos'][6]:.3f} "
+                            f"target_dq={np.array2string(target['vel'][:6], precision=4)} "
+                            f"joint_measured_error={measured_error:.4f} rad",
+                            flush=True,
+                        )
+                    else:
+                        print(f"RDP action: step={policy_index} status={action_status}", flush=True)
+                    next_action_report_ns = now_ns + 1_000_000_000
                 segment_start, segment_target, segment_index = command, target, index
         count += 1
         if now_ns >= next_report_ns:
@@ -362,7 +396,7 @@ def main(args: Args) -> None:
     specs = validate(args, model)
     print(
         f"Loaded {args.side} joint RDP: observation={args.control_hz} Hz, "
-        f"command={args.command_hz} Hz, diffusion={args.inference_hz} Hz, action=14D"
+        f"command={args.command_hz} Hz, diffusion={args.inference_hz} Hz, action=7D"
     )
     if args.validate_only:
         return

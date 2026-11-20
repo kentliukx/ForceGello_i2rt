@@ -69,16 +69,17 @@ def test_visual_latent_from_t_first_targets_the_command_at_t_plus_two() -> None:
 
 
 def test_joint_commands_keep_position_and_velocity_units_and_gripper_convention() -> None:
-    action = np.arange(14, dtype=float) / 10
-    command = run.joint_command(action)
-    np.testing.assert_allclose(command["pos"], action[:7])
-    np.testing.assert_allclose(command["vel"][:6], action[7:13])
+    action = np.arange(7, dtype=float) / 10
+    previous = action - 0.01
+    command = run.joint_command(action, previous, 20)
+    np.testing.assert_allclose(command["pos"], action)
+    np.testing.assert_allclose(command["vel"][:6], np.full(6, 0.2))
     assert command["vel"][6] == 0
     action[6] = 2
-    assert run.joint_command(action)["pos"][6] == 1
+    assert run.joint_command(action, previous, 20)["pos"][6] == 1
     action[0] = np.nan
     with pytest.raises(ValueError, match="finite"):
-        run.joint_command(action)
+        run.joint_command(action, previous, 20)
 
 
 def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(monkeypatch: Any) -> None:
@@ -122,7 +123,7 @@ def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(
 
         def decode(self, plan: Plan, temporal: dict) -> np.ndarray:
             target = 10 * (temporal["right_robot_joint_pos"][-1, 0] + 1)
-            return np.concatenate([np.full(7, target), np.full(7, target / 10)])
+            return np.full(7, target)
 
     planner = SimpleNamespace(submit=lambda *args: None, latest=lambda: Plan(0, 0, np.zeros(1)), clear=lambda: None)
     projection = SimpleNamespace(project=lambda state: {"right_robot_joint_pos": state["joint_pos"]})
@@ -142,7 +143,7 @@ def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(
         [command["pos"][0] for _, command in commands], [0, 0, 0, 0, 20 / 3, 40 / 3, 20]
     )
     np.testing.assert_allclose(
-        [command["vel"][0] for _, command in commands], [0, 0, 0, 0, 2 / 3, 4 / 3, 2]
+        [command["vel"][0] for _, command in commands], [0, 0, 0, 0, 400, 400, 400]
     )
     np.testing.assert_allclose(np.diff(submitted_ns) / 1e9, 1 / 60, atol=1e-8)
 
@@ -178,8 +179,8 @@ def test_slow_inference_is_asynchronous_and_replaces_pending_observations() -> N
 
 
 @pytest.mark.parametrize("presses,steps", [([0], 25), ([0, 15, 20], 35), ([], 25)])
-def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_force(
-    monkeypatch: Any, presses: list[int], steps: int
+def test_control_loop_keeps_20hz_and_decodes_with_current_joint_state(
+    monkeypatch: Any, capsys: Any, presses: list[int], steps: int
 ) -> None:
     now = [1_000_000_000]
     events, commands, submitted_ns = [], [], []
@@ -222,13 +223,14 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
     class Model:
         horizon, past_steps, n_obs_steps, ratio = 32, 6, 2, 3
         obs_meta = {"right_robot_joint_pos": {"shape": [7]}}
-        extended_meta = {"right_robot_tcp_wrench": {"shape": [6]}}
+        extended_meta = {"right_robot_joint_pos": {"shape": [7]}, "right_robot_joint_vel": {"shape": [7]}}
 
         def decode(self, plan: Plan, temporal: dict) -> np.ndarray:
-            force = temporal["right_robot_tcp_wrench"][:, 0]
+            joint = temporal["right_robot_joint_pos"][:, 0]
             # The decoder observes only start..current and its last command targets current+1.
-            np.testing.assert_array_equal(force, np.arange(plan.start_step, stop.step + 1))
-            return np.concatenate([np.full(7, force[-1] + 1), np.full(7, 0.5 * force[-1])])
+            np.testing.assert_array_equal(joint, np.arange(plan.start_step, stop.step + 1))
+            np.testing.assert_array_equal(temporal["right_robot_joint_vel"][:, 0], joint)
+            return np.full(7, joint[-1] + 1)
 
     class Planner:
         pending = active = None
@@ -257,7 +259,7 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
     projection = SimpleNamespace(
         project=lambda state: {
             "right_robot_joint_pos": state["joint_pos"],
-            "right_robot_tcp_wrench": np.full(6, stop.step),
+            "right_robot_joint_vel": np.full(7, stop.step),
         }
     )
     monkeypatch.setattr(run.time, "monotonic_ns", lambda: now[0])
@@ -267,7 +269,10 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
         Planner(),
         projection,
         SimpleNamespace(read=read_images),
-        args=run.Args(checkpoint=Path("unused"), max_steps=steps, inference_hz=2, command_hz=20),
+        args=run.Args(
+            checkpoint=Path("unused"), max_steps=steps, inference_hz=2,
+            command_hz=20, debug_actions=bool(presses),
+        ),
         stop=stop,
         buttons=SimpleNamespace(consume_toggles=lambda since_ns: int(stop.step in presses)),
     )
@@ -281,13 +286,17 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
         assert [name for index, name in events if index == step] == ["read", expected, "gravity-and-submit"]
     assert len(commands) == sum(command_steps)
     assert len(submitted_ns) == steps
+    debug_output = capsys.readouterr().out
+    assert ("RDP action:" in debug_output) == bool(presses)
+    if presses == [0]:
+        assert "target_q=" in debug_output and "target_dq=" in debug_output
     np.testing.assert_allclose(np.diff(submitted_ns) / 1e9, 1 / 20, atol=1e-8)
     by_step = {step: command for step, _, command in commands}
     if presses:
         assert by_step[12]["pos"][0] == 0
         assert by_step[13]["pos"][0] == 0  # observation 13 is decoded, but not sent yet
         assert by_step[14]["pos"][0] == 14  # observation 13 targets control slot 14
-        assert by_step[14]["vel"][0] == 6.5
+        assert by_step[14]["vel"][0] == 280
         assert by_step[14]["vel"][6] == 0
     if 15 in presses:
         assert not any(step in by_step for step in range(15, 20))
@@ -328,7 +337,7 @@ def test_validate_opens_only_model_selected_camera_devices() -> None:
             "right_wrist_img": {"type": "rgb", "shape": [3, 240, 320]},
             "right_robot_joint_pos": {"shape": [7]},
         },
-        extended_meta={"right_robot_tcp_wrench": {"shape": [6]}},
+        extended_meta={"right_robot_joint_pos": {"shape": [7]}, "right_robot_joint_vel": {"shape": [7]}},
     )
     args = run.Args(checkpoint=Path("unused"), external_camera="0", right_wrist_camera="2")
     assert set(run.validate(args, model)) == {"external_img", "right_wrist_img"}
