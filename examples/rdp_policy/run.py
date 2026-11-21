@@ -401,7 +401,7 @@ def main(args: Args) -> None:
     if args.validate_only:
         return
     import torch
-    from post_process_forcegello import ArmKinematics
+    from examples.bimanual_data_collection.post_process_forcegello import ArmKinematics
 
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
