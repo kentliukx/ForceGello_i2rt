@@ -227,13 +227,23 @@ class LiveImages:
         self.packets.close()
 
 
-def joint_command(action: np.ndarray) -> dict[str, np.ndarray]:
+def joint_command(action: np.ndarray, previous_pos: np.ndarray, control_hz: float) -> dict[str, np.ndarray]:
+    """Compute the 20 Hz position target and its finite-difference arm velocity."""
     action = np.asarray(action, dtype=float)
-    if action.shape != (14,) or not np.all(np.isfinite(action)):
-        raise ValueError("expected finite pos7/vel7 action")
-    pos, vel = action[:7].copy(), action[7:].copy()
+    previous_pos = np.asarray(previous_pos, dtype=float)
+    if (
+        action.shape != (7,)
+        or previous_pos.shape != (7,)
+        or not np.all(np.isfinite(action))
+        or not np.all(np.isfinite(previous_pos))
+    ):
+        raise ValueError("expected finite 7D joint positions")
+    if not math.isfinite(control_hz) or control_hz <= 0:
+        raise ValueError("control_hz must be finite and positive")
+    pos = action.copy()
     pos[6] = np.clip(pos[6], 0.0, 1.0)
-    vel[6] = 0.0
+    vel = np.zeros(7)
+    vel[:6] = (pos[:6] - previous_pos[:6]) * control_hz
     return {"pos": pos, "vel": vel}
 
 
@@ -241,7 +251,10 @@ def interpolate_command(
     start: dict[str, np.ndarray], target: dict[str, np.ndarray], fraction: float
 ) -> dict[str, np.ndarray]:
     fraction = min(1.0, max(0.0, fraction))
-    return {key: start[key] + fraction * (target[key] - start[key]) for key in ("pos", "vel")}
+    return {
+        "pos": start["pos"] + fraction * (target["pos"] - start["pos"]),
+        "vel": target["vel"].copy(),
+    }
 
 
 def control_loop(
@@ -337,7 +350,7 @@ def control_loop(
                         )
                     target = {"pos": hold.copy(), "vel": np.zeros(7)}
                 else:
-                    target = joint_command(action)
+                    target = joint_command(action, command["pos"], args.control_hz)
                     active = True
                     last_action_ns = now_ns
                 if args.debug_actions and now_ns >= next_action_report_ns:
@@ -383,12 +396,12 @@ def main(args: Args) -> None:
     specs = validate(args, model)
     print(
         f"Loaded {args.side} joint RDP: observation={args.control_hz} Hz, "
-        f"command={args.command_hz} Hz, diffusion={args.inference_hz} Hz, action=14D"
+        f"command={args.command_hz} Hz, diffusion={args.inference_hz} Hz, action=7D"
     )
     if args.validate_only:
         return
     import torch
-    from post_process_forcegello import ArmKinematics
+    from examples.bimanual_data_collection.post_process_forcegello import ArmKinematics
 
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
