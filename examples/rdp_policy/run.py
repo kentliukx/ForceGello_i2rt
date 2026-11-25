@@ -71,6 +71,7 @@ class Args:
     policy_timeout_s: float = 1.0
     max_steps: int | None = None
     validate_only: bool = False  # Load/validate checkpoint without opening CAN or cameras.
+    debug_actions: bool = False  # Print one policy/action diagnostic per second.
 
 
 def validate(args: Args, model: Any) -> dict[str, Any]:
@@ -266,6 +267,7 @@ def control_loop(
     last_policy_index = -1
     count = 0
     next_report_ns = started_ns
+    next_action_report_ns = started_ns
     while not stop.is_set() and (args.max_steps is None or count < args.max_steps):
         if stop.wait(max(0.0, (clock.deadline_ns - time.monotonic_ns()) / 1e9)):
             break
@@ -305,6 +307,7 @@ def control_loop(
             if policy_tick:
                 frame_values = images.read(now_ns, required=True)
                 action = None
+                action_status = "camera unavailable"
                 if frame_values is not None:
                     observations = projection.project(state)
                     observations.update(frame_values)
@@ -314,14 +317,18 @@ def control_loop(
                             policy_index, history.observations(model.obs_meta, model.n_obs_steps, model.ratio)
                         )
                     plan = planner.latest()
+                    action_status = "no plan yet"
                     # A visual latent from observation t becomes available to
                     # the fast proprio decoder no earlier than tick t + 1.
                     if plan is not None and plan.anchor_step >= policy_index:
+                        action_status = "plan waiting for next observation"
                         plan = None
                     if plan is not None:
                         temporal = history.temporal(plan, model.horizon, model.extended_meta)
+                        action_status = "plan history unavailable"
                         if temporal is not None:
                             action = model.decode(plan, temporal)
+                            action_status = "decoded"
                 if action is None:
                     timeout = args.policy_timeout_s if active else args.startup_timeout_s
                     if now_ns - last_action_ns > timeout * 1e9:
@@ -333,6 +340,20 @@ def control_loop(
                     target = joint_command(action)
                     active = True
                     last_action_ns = now_ns
+                if args.debug_actions and now_ns >= next_action_report_ns:
+                    if action is not None:
+                        print(
+                            f"RDP action: step={policy_index} status={action_status} "
+                            f"joint_target={np.array2string(target['pos'][:6], precision=4)} "
+                            f"joint_velocity_target={np.array2string(target['vel'][:6], precision=4)} "
+                            f"gripper={target['pos'][6]:.3f} "
+                            f"joint_command_delta={np.array2string(target['pos'][:6] - hold[:6], precision=4)} "
+                            f"joint_measured_error={np.max(np.abs(target['pos'][:6] - state['joint_pos'][:6])):.4f} rad",
+                            flush=True,
+                        )
+                    else:
+                        print(f"RDP action: step={policy_index} status={action_status}", flush=True)
+                    next_action_report_ns = now_ns + 1_000_000_000
                 segment_start, segment_target, segment_index = command, target, index
         count += 1
         if now_ns >= next_report_ns:
