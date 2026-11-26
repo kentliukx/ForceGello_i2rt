@@ -34,7 +34,7 @@ GRU 只使用已经观测到的位置、速度和力历史，不填充未来反�
 目标为 20 Hz，Linux 调度不提供硬实时保证；超时时钟槽会跳过，日志记录 `missed`。
 
 当前支持 `space=joint`、`key=right_robot_command`（或左臂对应字段）、输出 7 维的含力观测 RDP checkpoint。
-网络动作布局 `[q1..q6,gripper]`；从臂前六个关节的速度目标按相邻 20 Hz 位置命令差分除以 0.05 秒得到，夹爪速度强制为 0。夹爪位置保持归一化 [0,1]。
+网络动作布局 `[q1..q6,gripper]`；从臂前六个关节的速度目标按相邻 20 Hz 位置命令差分除以 0.05 秒得到，再逐关节限制在 [-1, 1] rad/s；夹爪速度强制为 0。夹爪位置保持归一化 [0,1]。
 源 Zarr 的 `right_robot_command` 仍为 14 维；训练加载器只取前七维作为标签，无需重新转换已有数据。旧 14 维动作 checkpoint 需要重新训练 AT 与 RDP。
 该布局对应训练标签 `action[t] = 主臂[t+1]`。对二阶段训练时设置了
 `slow_obs_latency_steps: 1` 的新 checkpoint，t=0 ms 的慢视觉向量最早在

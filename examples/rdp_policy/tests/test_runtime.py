@@ -82,6 +82,13 @@ def test_joint_commands_keep_position_and_velocity_units_and_gripper_convention(
         run.joint_command(action, previous, 20)
 
 
+def test_joint_command_clips_differenced_arm_velocity_per_joint() -> None:
+    action = np.array([0.2, -0.2, 0.1, -0.1, 0.05, -0.05, 0.7])
+    command = run.joint_command(action, np.zeros(7), 20)
+    np.testing.assert_allclose(command["pos"], action)
+    np.testing.assert_allclose(command["vel"], [2, -2, 2, -2, 1, -1, 0])
+
+
 def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(monkeypatch: Any) -> None:
     now = [1_000_000_000]
     commands, submitted_ns = [], []
@@ -143,7 +150,7 @@ def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(
         [command["pos"][0] for _, command in commands], [0, 0, 0, 0, 20 / 3, 40 / 3, 20]
     )
     np.testing.assert_allclose(
-        [command["vel"][0] for _, command in commands], [0, 0, 0, 0, 400, 400, 400]
+        [command["vel"][0] for _, command in commands], [0, 0, 0, 0, 2, 2, 2]
     )
     np.testing.assert_allclose(np.diff(submitted_ns) / 1e9, 1 / 60, atol=1e-8)
 
@@ -288,7 +295,7 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
         assert by_step[12]["pos"][0] == 0
         assert by_step[13]["pos"][0] == 0  # observation 13 is decoded, but not sent yet
         assert by_step[14]["pos"][0] == 14  # observation 13 targets control slot 14
-        assert by_step[14]["vel"][0] == 280
+        assert by_step[14]["vel"][0] == 2
         assert by_step[14]["vel"][6] == 0
     if 15 in presses:
         assert not any(step in by_step for step in range(15, 20))

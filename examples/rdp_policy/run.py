@@ -25,6 +25,7 @@ from examples.rdp_policy.buttons import HandleButtons
 from examples.rdp_policy.runtime import History, RDPModel, SlowPlanner
 
 CAMERA_KEYS = {"external_img": "external", "left_wrist_img": "left_wrist", "right_wrist_img": "right_wrist"}
+MAX_JOINT_VEL_RAD_S = 1.0
 STATE_SHAPES = {
     "joint_pos": [7],
     "joint_vel": [7],
@@ -243,7 +244,11 @@ def joint_command(action: np.ndarray, previous_pos: np.ndarray, control_hz: floa
     pos = action.copy()
     pos[6] = np.clip(pos[6], 0.0, 1.0)
     vel = np.zeros(7)
-    vel[:6] = (pos[:6] - previous_pos[:6]) * control_hz
+    vel[:6] = np.clip(
+        (pos[:6] - previous_pos[:6]) * control_hz,
+        -MAX_JOINT_VEL_RAD_S,
+        MAX_JOINT_VEL_RAD_S,
+    )
     return {"pos": pos, "vel": vel}
 
 
