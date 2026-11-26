@@ -15,6 +15,7 @@ class Plan:
     anchor_step: int
     start_step: int
     latent: np.ndarray
+    base_joint_pos: np.ndarray | None = None
 
 
 class History:
@@ -94,21 +95,42 @@ class RDPModel:
             raise ValueError("this runner requires a single-arm 7D joint-position RDP checkpoint")
         if (
             meta.action.get("key") != f"{side}_robot_command"
-            or cfg.task.dataset.relative_action
+            or not cfg.task.dataset.relative_action
             or cfg.task.dataset.delta_action
         ):
-            raise ValueError("checkpoint arm/command key must match --side and use absolute joint targets")
+            raise ValueError("checkpoint arm/command key must match --side and use relative joint targets")
+        if cfg.task.dataset.get("relative_joint_anchor") != "slow_observation":
+            raise ValueError("RDP checkpoint must use the fixed slow_observation joint anchor")
+        if cfg.task.dataset.get("absolute_gripper_action") is not True:
+            raise ValueError("RDP checkpoint must use an absolute gripper action")
         if "latent_diffusion" not in cfg.policy._target_ or not cfg.policy.at.use_rnn_decoder:
             raise ValueError("expected Latent Diffusion Policy with the reactive GRU AT decoder")
-        wrench_key = f"{side}_robot_tcp_wrench"
-        if (
-            wrench_key not in meta.obs
-            or wrench_key not in meta.extended_obs
-            or list(meta.obs[wrench_key].shape) != [6]
-            or list(meta.extended_obs[wrench_key].shape) != [6]
-        ):
-            raise ValueError("RDP checkpoint must include 6D TCP wrench in both slow and fast observations")
+        effort_key = f"{side}_robot_joint_effort_external"
+        if effort_key not in meta.obs or list(meta.obs[effort_key].shape) != [6]:
+            raise ValueError("RDP checkpoint must include 6D joint residual torque in slow observations")
+        if list(meta.extended_obs.keys()) != [effort_key] or list(meta.extended_obs[effort_key].shape) != [6]:
+            raise ValueError("RDP fast decoder must use only 6D joint residual torque")
         path = resolve_at_checkpoint(checkpoint, str(cfg.at_load_dir), rdp_root, at_checkpoint)
+        at_payload = torch.load(path, map_location="cpu", pickle_module=dill, weights_only=False)
+        at_cfg = at_payload.get("cfg")
+        if at_cfg is None or not at_cfg.task.dataset.relative_action or at_cfg.task.dataset.delta_action:
+            raise ValueError("AT checkpoint must have been trained with relative joint actions")
+        if at_cfg.task.dataset.get("relative_joint_anchor") != "slow_observation":
+            raise ValueError("AT checkpoint must use the fixed slow_observation joint anchor")
+        if at_cfg.task.dataset.get("absolute_gripper_action") is not True:
+            raise ValueError("AT checkpoint must use an absolute gripper action")
+        if int(at_cfg.task.dataset.get("slow_obs_latency_steps", 0)) != int(cfg.task.dataset.get("slow_obs_latency_steps", 0)):
+            raise ValueError("AT and RDP slow observation timing must match")
+        at_meta = at_cfg.task.shape_meta
+        if list(at_meta.action.shape) != [7] or at_meta.action.get("key") != meta.action.get("key"):
+            raise ValueError("AT checkpoint action key/shape must match RDP")
+        at_keys = list(at_meta.extended_obs.keys())
+        if at_keys != list(meta.extended_obs.keys()) or any(
+            list(at_meta.extended_obs[key].shape) != list(meta.extended_obs[key].shape)
+            for key in at_keys
+        ):
+            raise ValueError("AT checkpoint fast observations must match RDP")
+        del at_payload
         cfg.policy.at.load_dir = str(path)
         cfg.policy.at.device = device
         self.policy = hydra.utils.instantiate(cfg.policy)
@@ -124,12 +146,15 @@ class RDPModel:
         self.fast_at.normalizer.to("cpu")
         self.fast_at.eval()
         self.obs_meta = OmegaConf.to_container(meta.obs, resolve=True)
+        self.joint_pos_key = f"{side}_robot_joint_pos"
+        if self.joint_pos_key not in self.obs_meta:
+            raise ValueError("checkpoint must contain slow joint position observations")
         self.extended_meta = OmegaConf.to_container(meta.extended_obs, resolve=True)
         self.n_obs_steps = int(cfg.n_obs_steps)
         self.ratio = int(cfg.dataset_obs_temporal_downsample_ratio)
         self.past_steps = self.n_obs_steps * self.ratio
         self.slow_obs_latency_steps = int(cfg.task.dataset.get("slow_obs_latency_steps", 0))
-        if not 0 <= self.slow_obs_latency_steps < self.past_steps:
+        if self.slow_obs_latency_steps != 1 or self.past_steps <= 1:
             raise ValueError("checkpoint has invalid slow_obs_latency_steps")
         self.horizon = int(cfg.horizon)
         self.control_hz = float(cfg.task.get("control_hz", 60.0))
@@ -145,6 +170,9 @@ class RDPModel:
         self.device = device
 
     def infer(self, anchor_step: int, observations: dict[str, np.ndarray]) -> Plan:
+        base_joint_pos = np.asarray(observations[self.joint_pos_key][-1], dtype=np.float64).copy()
+        if base_joint_pos.shape != (7,) or not np.all(np.isfinite(base_joint_pos)):
+            raise ValueError("slow observation must contain a finite 7D joint anchor")
         tensors = {
             key: self.torch.from_numpy(np.ascontiguousarray(value)).unsqueeze(0).to(self.device)
             for key, value in observations.items()
@@ -160,6 +188,7 @@ class RDPModel:
             anchor_step,
             anchor_step - self.past_steps + 1 + self.slow_obs_latency_steps,
             latent,
+            base_joint_pos,
         )
 
     def decode(self, plan: Plan, temporal: dict[str, np.ndarray]) -> np.ndarray:

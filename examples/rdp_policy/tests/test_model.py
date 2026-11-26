@@ -11,7 +11,7 @@ pytest.importorskip("diffusers")
 pytest.importorskip("peft")
 
 from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from examples.rdp_policy import run
 from examples.rdp_policy.runtime import RDPModel, resolve_at_checkpoint
@@ -45,7 +45,7 @@ def checkpoint(tmp_path: Path) -> Path:
         )
     OmegaConf.resolve(cfg)
     tokenizer = hydra.utils.instantiate(cfg.policy.at, load_dir=None)
-    torch.save({"state_dicts": {"model": tokenizer.state_dict()}}, at_path)
+    torch.save({"state_dicts": {"model": tokenizer.state_dict()}, "cfg": cfg}, at_path)
     model = hydra.utils.instantiate(cfg.policy)
     rng = np.random.default_rng(42)
     normalizer = LinearNormalizer()
@@ -73,20 +73,19 @@ def test_actual_checkpoint_latent_and_force_reactive_cpu_decoder(checkpoint: Pat
     observations = {key: np.zeros((2, *meta["shape"]), dtype=np.float32) for key, meta in model.obs_meta.items()}
     plan = model.infer(30, observations)
     assert plan.anchor_step == 30 and plan.start_step == 24
+    np.testing.assert_array_equal(plan.base_joint_pos, np.zeros(7))
     assert model.policy.num_inference_steps == 2
     assert model.visual_hz == 5 and model.control_hz == 20
+    assert list(model.extended_meta) == ["right_robot_joint_effort_external"]
+    assert model.fast_at.rnn_temporal_cond_dim == 6
     with pytest.raises(ValueError, match="visual sampling rate"):
         run.validate(run.Args(checkpoint=checkpoint, device="cpu", camera_hz=20, validate_only=True), model)
     temporal = {key: np.zeros((11, *meta["shape"]), dtype=np.float32) for key, meta in model.extended_meta.items()}
     action1 = model.decode(plan, temporal)
-    temporal["right_robot_tcp_wrench"][-1] = 3
+    temporal["right_robot_joint_effort_external"][-1] = 3
     action2 = model.decode(plan, temporal)
     assert action1.shape == action2.shape == (7,)
     assert np.all(np.isfinite(action2)) and not np.allclose(action1, action2)
-    temporal["right_robot_joint_pos"][-1] = 1
-    temporal["right_robot_joint_vel"][-1] = -1
-    action3 = model.decode(plan, temporal)
-    assert not np.allclose(action2, action3)  # proprioception reaches the reactive decoder too
     assert all(parameter.device.type == "cpu" for parameter in model.fast_at.decoder.parameters())
 
 
@@ -103,3 +102,40 @@ def test_wrong_arm_checkpoint_rejected_before_hardware(checkpoint: Path) -> None
         RDPModel(checkpoint, RDP_ROOT, "cpu", "left")
     with pytest.raises(FileNotFoundError):
         resolve_at_checkpoint(checkpoint, "/missing/file", RDP_ROOT, Path("/missing/override"))
+
+
+def test_old_absolute_action_checkpoint_rejected_before_hardware(checkpoint: Path, tmp_path: Path) -> None:
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload["cfg"].task.dataset.relative_action = False
+    old = tmp_path / "old.ckpt"
+    torch.save(payload, old)
+    with pytest.raises(ValueError, match="relative joint targets"):
+        RDPModel(old, RDP_ROOT, "cpu", "right")
+
+
+def test_old_per_step_relative_checkpoint_rejected_before_hardware(checkpoint: Path, tmp_path: Path) -> None:
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    del payload["cfg"].task.dataset.relative_joint_anchor
+    old = tmp_path / "old_relative.ckpt"
+    torch.save(payload, old)
+    with pytest.raises(ValueError, match="fixed slow_observation joint anchor"):
+        RDPModel(old, RDP_ROOT, "cpu", "right")
+
+
+def test_old_relative_gripper_checkpoint_rejected_before_hardware(checkpoint: Path, tmp_path: Path) -> None:
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    del payload["cfg"].task.dataset.absolute_gripper_action
+    old = tmp_path / "old_relative_gripper.ckpt"
+    torch.save(payload, old)
+    with pytest.raises(ValueError, match="absolute gripper action"):
+        RDPModel(old, RDP_ROOT, "cpu", "right")
+
+
+def test_fast_joint_state_checkpoint_rejected_before_hardware(checkpoint: Path, tmp_path: Path) -> None:
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    with open_dict(payload["cfg"].task.shape_meta.extended_obs):
+        payload["cfg"].task.shape_meta.extended_obs.right_robot_joint_pos = {"shape": [7], "type": "low_dim"}
+    old = tmp_path / "old_fast_proprio.ckpt"
+    torch.save(payload, old)
+    with pytest.raises(ValueError, match="fast decoder must use only"):
+        RDPModel(old, RDP_ROOT, "cpu", "right")

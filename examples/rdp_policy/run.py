@@ -29,12 +29,7 @@ MAX_JOINT_VEL_RAD_S = 1.0
 STATE_SHAPES = {
     "joint_pos": [7],
     "joint_vel": [7],
-    "joint_effort": [6],
     "joint_effort_external": [6],
-    "tcp_pose": [9],
-    "tcp_vel": [6],
-    "tcp_wrench": [6],
-    "gripper_width": [1],
 }
 
 
@@ -63,9 +58,6 @@ class Args:
     camera_width: int = 640
     camera_height: int = 480
     jpeg_quality: int = 90
-    wrench_damping: float = 0.01
-    wrench_sign: float = 1.0
-    gripper_max_width_m: float = 0.095
     stale_state_s: float = 0.2
     stale_camera_s: float = 0.5
     startup_timeout_s: float = 30.0
@@ -81,8 +73,6 @@ def validate(args: Args, model: Any) -> dict[str, Any]:
         "command_hz",
         "inference_hz",
         "camera_hz",
-        "wrench_damping",
-        "gripper_max_width_m",
         "stale_state_s",
         "stale_camera_s",
         "startup_timeout_s",
@@ -109,8 +99,8 @@ def validate(args: Args, model: Any) -> dict[str, Any]:
         raise ValueError("yellow_button_index must be handle input 0 or 1")
     if args.camera_capture_hz < args.camera_hz or min(args.camera_width, args.camera_height) < 1:
         raise ValueError("invalid camera capture rate or dimensions")
-    if not 1 <= args.jpeg_quality <= 100 or args.wrench_sign not in (-1.0, 1.0):
-        raise ValueError("invalid JPEG quality or wrench sign")
+    if not 1 <= args.jpeg_quality <= 100:
+        raise ValueError("invalid JPEG quality")
     cameras = {}
     supported = {f"{args.side}_robot_{key}": shape for key, shape in STATE_SHAPES.items()}
     for key, meta in {**model.obs_meta, **model.extended_meta}.items():
@@ -228,20 +218,47 @@ class LiveImages:
         self.packets.close()
 
 
-def joint_command(action: np.ndarray, previous_pos: np.ndarray, control_hz: float) -> dict[str, np.ndarray]:
-    """Compute the 20 Hz position target and its finite-difference arm velocity."""
+class JointStateProjection:
+    """Expose measured joint state and raw residual torque without TCP inversion."""
+
+    def __init__(self, side: str) -> None:
+        self.side = side
+
+    def project(self, state: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        fields = {
+            "joint_pos": (7, state["joint_pos"]),
+            "joint_vel": (7, state["joint_vel"]),
+            "joint_effort_external": (6, np.asarray(state["joint_eff_external"])[:6]),
+        }
+        result = {}
+        for key, (size, raw) in fields.items():
+            value = np.asarray(raw, dtype=np.float32)
+            if value.shape != (size,) or not np.all(np.isfinite(value)):
+                raise ValueError(f"expected finite {size}D {key}")
+            result[f"{self.side}_robot_{key}"] = value.copy()
+        return result
+
+
+def joint_command(
+    action: np.ndarray, base_pos: np.ndarray, previous_pos: np.ndarray, control_hz: float
+) -> dict[str, np.ndarray]:
+    """Recover a target from the plan's fixed slow-observation joint anchor."""
     action = np.asarray(action, dtype=float)
+    base_pos = np.asarray(base_pos, dtype=float)
     previous_pos = np.asarray(previous_pos, dtype=float)
     if (
         action.shape != (7,)
+        or base_pos.shape != (7,)
         or previous_pos.shape != (7,)
         or not np.all(np.isfinite(action))
+        or not np.all(np.isfinite(base_pos))
         or not np.all(np.isfinite(previous_pos))
     ):
-        raise ValueError("expected finite 7D joint positions")
+        raise ValueError("expected finite 7D joint positions and relative action")
     if not math.isfinite(control_hz) or control_hz <= 0:
         raise ValueError("control_hz must be finite and positive")
     pos = action.copy()
+    pos[:6] += base_pos[:6]
     pos[6] = np.clip(pos[6], 0.0, 1.0)
     vel = np.zeros(7)
     vel[:6] = np.clip(
@@ -355,13 +372,14 @@ def control_loop(
                         )
                     target = {"pos": hold.copy(), "vel": np.zeros(7)}
                 else:
-                    target = joint_command(action, command["pos"], args.control_hz)
+                    target = joint_command(action, plan.base_joint_pos, command["pos"], args.control_hz)
                     active = True
                     last_action_ns = now_ns
                 if args.debug_actions and now_ns >= next_action_report_ns:
                     if action is not None:
                         print(
                             f"RDP action: step={policy_index} status={action_status} "
+                            f"relative_joint_action={np.array2string(action[:6], precision=4)} "
                             f"joint_target={np.array2string(target['pos'][:6], precision=4)} "
                             f"joint_velocity_target={np.array2string(target['vel'][:6], precision=4)} "
                             f"gripper={target['pos'][6]:.3f} "
@@ -406,20 +424,12 @@ def main(args: Args) -> None:
     if args.validate_only:
         return
     import torch
-    from examples.bimanual_data_collection.post_process_forcegello import ArmKinematics
-
     from i2rt.robots.get_robot import get_yam_robot
-    from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
+    from i2rt.robots.utils import ArmType, GripperType
 
     torch.set_num_threads(1)
     arm, gripper = ArmType.from_string_name(args.arm), GripperType.from_string_name(args.gripper)
-    projection = ArmKinematics(
-        Path(combine_arm_and_gripper_xml(arm, gripper)),
-        args.wrench_damping,
-        args.wrench_sign,
-        args.gripper_max_width_m,
-        args.side,
-    )
+    projection = JointStateProjection(args.side)
     images = planner = robot = buttons = None
     previous_handler = signal.signal(signal.SIGTERM, request_shutdown)
     try:
