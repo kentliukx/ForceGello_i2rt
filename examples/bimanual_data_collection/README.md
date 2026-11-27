@@ -2,18 +2,19 @@
 
 训练完成后的无 ROS 自主推理入口见 [YAM RDP 部署](../rdp_policy/README.md)。
 
-双臂共用一个控制进程、一个 **300 Hz** 上层控制循环。每轮读取四条 CAN 的最新状态；
-第 1、6、11……轮先计算两个从臂的重力补偿并提交命令（**60 Hz**），再计算两个主臂的重力补偿、
-力反馈并提交命令（**300 Hz**）。其余轮只更新主臂。机器人数据在从臂更新轮记录，仍为 60 Hz。
+双臂共用一个控制进程、一个 **60 Hz** 上层控制循环。每轮读取四条 CAN 的最新状态，
+更新 NEXT，再提交两个从臂的位置命令，然后更新两个主臂的重力补偿与力反馈。
+从臂命令、主臂反馈和机器人记录均为 60 Hz；从臂位置跟随主臂，速度目标始终为 0。
 
 采集器通过 `get_yam_robot(background_control=False)` 关闭各机械臂的独立 `robot_server` 线程，
 显式调用 `refresh_state()` 读取 CAN buffer、`update()` 计算重力并更新命令 buffer。底层 CAN 线程保持原样，
-持续收发最新状态/命令。原来的 `minimum_gello.py` 和 `bimanual_lead_follower.py` 保持不变，默认仍开启后台控制。
-力反馈复用 `minimum_gello` 的 `angle`/`torque` 公式、20 ms 角度预测和 alpha/beta 调节。
-力矩残差扣除各臂最近一次提交的重力项，并保存该项为 `joint_eff_gravity`，从臂不会在 60 Hz 更新之间额外计算重力。
+持续收发最新状态/命令。默认反馈源改为 NEXT；首先扣除最近一次提交的重力项，
+再减去 NEXT 预测的自由运动残差。主臂反馈为 `-bilateral_kp * NEXT外力矩`，不使用旧 alpha/beta 衰减。
+先完成 [NEXT 自由运动采集与训练](../next/README.md)，生成 `data/next/left.pt` 和 `right.pt`。
+模型缺失时在打开硬件之前报错。
 
 三路相机各自独立取流，以 **20 Hz** 保存最新帧；文件写入在主进程进行。
-控制线程使用绝对单调时钟，超时跳过时钟槽、不突发补发；从臂始终每五次实际迭代更新一次。
+控制线程使用绝对单调时钟，超时跳过时钟槽、不突发补发。
 这里保证上层计算和命令 buffer 提交的先后顺序；各 CAN 线程独立发送，实际总线发送顺序和 Linux 唤醒时间不构成硬实时保证。
 
 ## 启动
@@ -27,8 +28,8 @@ python examples/bimanual_data_collection/collect_data.py --list-cameras
 ```
 
 --list-cameras 只枚举设备，不打开机械臂。三台相机按序列号固定在
-[collect_data.py](collect_data.py) 的 CAMERA_DEVICES：左腕 D435 135122075425、
-右腕 D435 135122079769、外部 D415 036422060422。这些是 pyrealsense2 报出的序列号，
+[camera_devices.py](camera_devices.py) 的 CAMERA_DEVICES：左腕 D435 135122079769、
+右腕 D435 135122075425、外部 D415 036422060422。这些是 pyrealsense2 报出的序列号，
 与 `/dev/v4l/by-id` 名称里的 USB 序列号不同。更换相机或调整安装位置时修改此映射；
 录制的 metadata.json 也保存实际使用的映射。
 
@@ -36,7 +37,7 @@ python examples/bimanual_data_collection/collect_data.py --list-cameras
 python examples/bimanual_data_collection/collect_data.py
 ```
 
-默认预设：`--control-hz 60 --camera-hz 20 --feedback-mode angle --bilateral-kp 1 --bilateral-alpha 0 --bilateral-beta 5`。
+默认预设：`--control-hz 60 --camera-hz 20 --feedback-mode next --bilateral-kp 1`。
 输出目录默认为 `data/demonstrations`；命令行参数仍可覆盖预设。`--bilateral-kp 0` 可关闭额外反馈。
 不要同时运行旧的 `bimanual_lead_follower` 或其他占用同一 CAN 接口的程序。
 默认四个 CAN 接口是 `can_leader_l/r`、`can_follower_l/r`；可以通过 `--left-leader-can` 等参数覆盖。
@@ -83,7 +84,7 @@ data/demonstrations/
 - `command_monotonic_ns`：从臂高层命令调用时间；`follower_update_monotonic_ns` 是重力计算及命令 buffer 更新完成时间。夹爪限力可能进一步改变目标。
 - `leader_feedback_torque` / `leader_feedback_monotonic_ns`：主臂额外反馈力矩及其更新时间。
 - `cartesian`：同一从臂状态导出的 TCP/RPY、TCP 速度、局部 TCP wrench 估计。计算在保存进程中进行，不占用控制线程。
-- `buttons`、`teleoperation_mode`、实际/计划采样时间。`tick_index` 是 300 Hz 调度槽编号，`missed_periods` 是上次机器人采样以来跳过的主循环时钟槽数。
+- `buttons`、`teleoperation_mode`、实际/计划采样时间。`tick_index` 是 60 Hz 调度槽编号，`missed_periods` 是跳过的主循环时钟槽数。
 
 关节单位 rad/rad·s⁻¹，力矩 Nm；夹爪位置是归一化开度 [0,1]。时间使用 int64 纳秒，保留 Unix 与单调时钟。
 两组臂共用上层循环，CAN 反馈不是硬件同步，各自样本和 CAN 时间分别保留。相机时间为主机取到图像时刻，不能等同于曝光时刻；

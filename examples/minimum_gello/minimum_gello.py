@@ -638,7 +638,7 @@ def _leader_control_worker(
                     else None
                 )
             command_sequence += 1
-            command = {"pos": current_joint_pos.copy(), "vel": current_joint_vel.copy()}
+            command = {"pos": current_joint_pos.copy(), "vel": np.zeros_like(current_joint_pos)}
             if args.trace_latency and command_sequence % _LATENCY_TRACE_EVERY == 0:
                 command["trace"] = {
                     "trace_id": command_sequence,

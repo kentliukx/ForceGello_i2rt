@@ -36,7 +36,7 @@ from examples.bimanual_data_collection.recording import (
 class Args:
     output: Path = Path("data/demonstrations")
     list_cameras: bool = False
-    control_hz: float = 60.0  # Followers and recording; leaders run at five times this rate.
+    control_hz: float = 60.0  # Follower commands, NEXT samples, leader feedback and recording.
     camera_hz: float = 20.0
     camera_capture_hz: int = 30
     camera_width: int = 640
@@ -49,7 +49,11 @@ class Args:
     right_leader_can: str = "can_leader_r"
     left_follower_can: str = "can_follower_l"
     right_follower_can: str = "can_follower_r"
-    feedback_mode: Literal["angle", "torque"] = "angle"
+    feedback_mode: Literal["next", "none", "angle", "torque"] = "next"
+    next_left_checkpoint: Path = Path("data/next/left.pt")
+    next_right_checkpoint: Path = Path("data/next/right.pt")
+    next_calibration: bool = False  # Contact-free NEXT data; unconditionally disables feedback.
+    no_cameras: bool = False
     bilateral_kp: float = 1.0
     bilateral_alpha: float = 0.0
     bilateral_beta: float = 5.0
@@ -94,6 +98,57 @@ class ArmPair:
         self.follower_update_ns = 0
         self.feedback_torque = np.zeros(6)
         self.feedback_ns = 0
+        self.next_estimator = None
+        self.next_sample = None
+        self.next_external = np.zeros(6)
+        self.next_free = np.zeros(6)
+        self.next_ready = False
+        if args.feedback_mode == "next" and not args.next_calibration:
+            from i2rt.utils.next_torque import NextEstimator
+
+            self.next_estimator = NextEstimator(getattr(args, f"next_{side}_checkpoint"), args.control_hz, side)
+
+    def prepare_next(self) -> None:
+        """Pair the CAN observation with the target already held before this observation.
+
+        Never use the new leader target which is about to be submitted below.
+        Training and runtime both sample this exact contract at control_hz.
+        """
+        self.next_sample = None
+        if self.mode == "idle" or self.command is None:
+            self.next_ready = False
+            self.next_external = np.zeros(6)
+            if self.next_estimator is not None:
+                self.next_estimator.reset()
+                self.follower_obs["joint_eff_gravity_residual"] = self.follower_obs["joint_eff_external"].copy()
+                self.follower_obs["joint_eff_external"] = self.follower_obs["joint_eff_external"].copy()
+                self.follower_obs["joint_eff_external"][:6] = 0.0
+                self.follower_obs["next_ready"] = np.array(False)
+            return
+        obs = self.follower_obs
+        self.next_sample = {
+            "joint_pos": obs["joint_pos"][:6].copy(),
+            "joint_vel": obs["joint_vel"][:6].copy(),
+            "joint_cmd": self.command["pos"][:6].copy(),
+            "measured_joint_torque": obs["joint_eff_measured"][:6].copy(),
+            "applied_gravity_torque": obs["joint_eff_gravity"][:6].copy(),
+            "monotonic_ns": time.monotonic_ns(),
+        }
+        if self.next_estimator is not None:
+            result = self.next_estimator.update(
+                self.next_sample["joint_pos"],
+                self.next_sample["joint_vel"],
+                self.next_sample["joint_cmd"],
+                self.next_sample["measured_joint_torque"],
+                self.next_sample["monotonic_ns"],
+                self.next_sample["applied_gravity_torque"],
+            )
+            self.next_ready = result is not None
+            self.next_free, self.next_external = result if result is not None else (np.zeros(6), np.zeros(6))
+            obs["joint_eff_gravity_residual"] = obs["joint_eff_external"].copy()
+            obs["joint_eff_external"] = obs["joint_eff_external"].copy()
+            obs["joint_eff_external"][:6] = self.next_external
+            obs["next_ready"] = np.array(self.next_ready)
 
     def read(self, packets: Any) -> None:
         self.leader.refresh_state()
@@ -139,7 +194,7 @@ class ArmPair:
         elif self.mode == "following":
             self.command = {
                 "pos": self.pos.copy(),
-                "vel": np.concatenate([self.leader_obs["joint_vel"][:6], [0.0]]),
+                "vel": np.zeros_like(self.pos),
             }
         if self.command is None:
             self.follower.enter_gravity_comp_idle()
@@ -150,7 +205,7 @@ class ArmPair:
         # Compute gravity and submit to CAN's command buffer, including when idle.
         self.follower.update()
         self.follower_update_ns = time.monotonic_ns()
-        self.follower_obs = _snapshot(self.follower)
+        # Retain the pre-command snapshot: it is the state used by NEXT this tick.
 
     def update_leader(self) -> None:
         from examples.minimum_gello.minimum_gello import (
@@ -159,7 +214,15 @@ class ArmPair:
             _leader_feedback_torque,
         )
 
-        if self.mode == "following":
+        if self.args.next_calibration or self.args.feedback_mode == "none":
+            self.feedback_torque = np.zeros(6)
+            self.leader.enter_gravity_comp_idle()
+        elif self.mode == "following" and self.args.feedback_mode == "next":
+            # Motor effort is actuator-output torque: resist the measured load on the leader.
+            # NEXT replaces the signal, without the former angle/speed attenuation.
+            self.feedback_torque = -self.args.bilateral_kp * self.next_external if self.next_ready else np.zeros(6)
+            self.leader.command_joint_torques(self.feedback_torque)
+        elif self.mode == "following":
             target = self.follower_obs["joint_pos"][:6]
             if self.args.feedback_mode == "angle":
                 target = _leader_angle_target(target, self.leader_obs["joint_vel"][:6])
@@ -207,6 +270,10 @@ class ArmPair:
             "teleoperation_mode": self.mode,
             "leader_feedback_torque": self.feedback_torque.copy(),
             "leader_feedback_monotonic_ns": self.feedback_ns,
+            "next_sample": self.next_sample,
+            "next_ready": self.next_ready,
+            "next_free_torque": self.next_free.copy(),
+            "follower_velocity_target": "zero",
         }
 
 
@@ -232,7 +299,7 @@ def control_worker(args: Args, packets: Any, stop: Any, origin_ns: int) -> None:
                 raise ValueError("collection requires six-joint leaders and seven-joint followers including grippers")
             pairs.append(ArmPair(side, arms["leader"], arms["follower"], args))
         # Initialization may take seconds; do not count it as missed control ticks.
-        clock = PeriodicClock(args.control_hz * 5, max(origin_ns, time.monotonic_ns()))
+        clock = PeriodicClock(args.control_hz, max(origin_ns, time.monotonic_ns()))
         iteration, missed_since_sample = 0, 0
         while not stop.is_set():
             if stop.wait(max(0.0, (clock.deadline_ns - time.monotonic_ns()) / 1e9)):
@@ -241,20 +308,19 @@ def control_worker(args: Args, packets: Any, stop: Any, origin_ns: int) -> None:
             missed_since_sample += missed
             for pair in pairs:
                 pair.read(packets)
-            follower_tick = iteration % 5 == 0
-            if follower_tick:
-                for pair in pairs:
-                    pair.update_follower()
+            for pair in pairs:
+                pair.prepare_next()
+            for pair in pairs:
+                pair.update_follower()
             # Both followers finish before either leader computes and submits its command.
             for pair in pairs:
                 pair.update_leader()
-            if follower_tick:
-                if iteration == 0:
-                    for pair in pairs:
-                        packets.put_nowait({"kind": "ready", "name": pair.side})
+            if iteration == 0:
                 for pair in pairs:
-                    packets.put_nowait(pair.packet(index, scheduled_ns, missed_since_sample))
-                missed_since_sample = 0
+                    packets.put_nowait({"kind": "ready", "name": pair.side})
+            for pair in pairs:
+                packets.put_nowait(pair.packet(index, scheduled_ns, missed_since_sample))
+            missed_since_sample = 0
             iteration += 1
     except BaseException as error:
         if not stop.is_set():
@@ -356,14 +422,14 @@ class RecordingSession:
 
 
 def validate(args: Args) -> dict[str, str]:
-    cameras = dict(CAMERA_DEVICES)
+    cameras = {} if args.no_cameras else dict(CAMERA_DEVICES)
     camera_ids = {
         str(Path(f"/dev/video{device}" if device.isdigit() else device).resolve())
         if not device.startswith("realsense:")
         else device
         for device in cameras.values()
     }
-    if not all(cameras.values()) or len(camera_ids) != 3:
+    if cameras and (not all(cameras.values()) or len(camera_ids) != 3):
         raise ValueError("CAMERA_DEVICES must contain three distinct camera devices")
     for name in (
         "control_hz",
@@ -400,8 +466,20 @@ def main(args: Args) -> None:
         list_cameras()
         return
     cameras = validate(args)
+    if args.next_calibration and args.feedback_mode not in ("next", "none"):
+        raise ValueError("NEXT calibration must use --feedback-mode none (no haptic feedback)")
+    if args.feedback_mode == "next" and not args.next_calibration:
+        from i2rt.utils.next_torque import NextEstimator
+
+        # Reject missing/incompatible models before opening any CAN interfaces.
+        for side in ("left", "right"):
+            NextEstimator(getattr(args, f"next_{side}_checkpoint"), args.control_hz, side)
     logging.basicConfig(level=logging.INFO)
-    if args.bilateral_kp == 0:
+    if args.next_calibration:
+        print(
+            "NEXT calibration: free-space motion only; leader force feedback OFF; follower qdot target=0.", flush=True
+        )
+    elif args.bilateral_kp == 0:
         print("bilateral_kp=0: additional force feedback is disabled; supply your usual feedback gain.", flush=True)
     context = mp.get_context("spawn")
     packets = context.Queue(maxsize=args.queue_size)
@@ -424,18 +502,27 @@ def main(args: Args) -> None:
         "camera_devices": cameras,
         "git_revision": revision,
     }
-    projections = {
-        side: CartesianProjection(args.arm, args.follower_gripper, args.wrench_damping, args.wrench_sign)
-        for side in ("left", "right")
-    }
+    projections = (
+        None
+        if args.no_cameras
+        else {
+            side: CartesianProjection(args.arm, args.follower_gripper, args.wrench_damping, args.wrench_sign)
+            for side in ("left", "right")
+        }
+    )
     metadata["control_timing"] = {
-        "leader_hz": args.control_hz * 5,
+        "leader_hz": args.control_hz,
         "follower_hz": args.control_hz,
-        "follower_every_iterations": 5,
+        "follower_every_iterations": 1,
         "order": "read all CAN buffers; both followers when due; both leaders; robot samples when due",
-        "tick_index": "leader scheduler slot; follower update every five executed iterations",
+        "tick_index": "shared 60 Hz application scheduler slot",
         "missed_periods": "skipped leader slots since the preceding robot sample",
         "gravity_residual": "measured effort minus last submitted gravity compensation term",
+        "effort_external_source": "next"
+        if args.feedback_mode == "next" and not args.next_calibration
+        else "gravity_residual",
+        "follower_velocity_target": "zero",
+        "next_input": "pre-command q/qdot/measured Nm paired with the preceding held position target",
     }
     metadata["cartesian"] = {
         "site": "grasp_site",
@@ -446,6 +533,7 @@ def main(args: Args) -> None:
         "sign": args.wrench_sign,
     }
     session = RecordingSession(args, metadata, projections)
+    required_ready = {"left", "right", *cameras}
     ready: set[str] = set()
     last_seen: dict[str, int] = {}
     started_ns = time.monotonic_ns()
@@ -467,9 +555,9 @@ def main(args: Args) -> None:
                     raise RuntimeError(f"{packet['name']}: {packet['error']}")
                 if kind == "ready":
                     ready.add(packet["name"])
-                    print(f"READY {packet['name']} ({len(ready)}/5)", flush=True)
+                    print(f"READY {packet['name']} ({len(ready)}/{len(required_ready)})", flush=True)
                 elif kind == "toggle":
-                    if len(ready) == 5:
+                    if ready == required_ready:
                         session.toggle(packet["monotonic_ns"])
                     else:
                         print("White button ignored: waiting for both arm pairs and all three cameras.", flush=True)
@@ -479,9 +567,9 @@ def main(args: Args) -> None:
             for worker in workers:
                 if worker.exitcode is not None:
                     raise RuntimeError(f"{worker.name} exited ({worker.exitcode})")
-            if len(ready) < 5 and now_ns - started_ns > args.startup_timeout_s * 1e9:
+            if ready != required_ready and now_ns - started_ns > args.startup_timeout_s * 1e9:
                 raise TimeoutError(f"startup timeout; ready devices: {sorted(ready)}")
-            if len(ready) == 5:
+            if ready == required_ready:
                 for name in ready:
                     if name in last_seen and now_ns - last_seen[name] > 3e9:
                         raise TimeoutError(f"no samples from {name} for 3 seconds")

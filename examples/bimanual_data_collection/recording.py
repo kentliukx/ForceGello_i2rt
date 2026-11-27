@@ -102,8 +102,13 @@ class EpisodeWriter:
             "action_semantics": "command.pos/vel are the targets passed to follower.command_joint_state; "
             "joint angles rad, velocities rad/s, gripper position normalized [0,1]; "
             "motor-side clipping/force limiting can further modify execution",
-            "effort_semantics": "joint_eff_external = measured actuator effort - modeled gravity; "
-            "includes tracking, friction and inertial effects; not a six-axis force sensor",
+            "effort_semantics": (
+                "joint_eff_external[:6] = measured actuator effort - applied gravity - NEXT free-motion residual; "
+                "NEXT warmup/idle is invalid (next_ready=false); not a six-axis force sensor"
+                if metadata.get("control_timing", {}).get("effort_external_source") == "next"
+                else "joint_eff_external = measured actuator effort - modeled gravity; "
+                "includes tracking, friction and inertial effects; not a six-axis force sensor"
+            ),
         }
         self._write_metadata()
 

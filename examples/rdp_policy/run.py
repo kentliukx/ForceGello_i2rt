@@ -25,7 +25,6 @@ from examples.rdp_policy.buttons import HandleButtons
 from examples.rdp_policy.runtime import History, RDPModel, SlowPlanner
 
 CAMERA_KEYS = {"external_img": "external", "left_wrist_img": "left_wrist", "right_wrist_img": "right_wrist"}
-MAX_JOINT_VEL_RAD_S = 1.0
 STATE_SHAPES = {
     "joint_pos": [7],
     "joint_vel": [7],
@@ -65,6 +64,7 @@ class Args:
     max_steps: int | None = None
     validate_only: bool = False  # Load/validate checkpoint without opening CAN or cameras.
     debug_actions: bool = False  # Print one policy/action diagnostic per second.
+    next_checkpoint: Path | None = None  # Defaults to data/next/{side}.pt.
 
 
 def validate(args: Args, model: Any) -> dict[str, Any]:
@@ -261,11 +261,7 @@ def joint_command(
     pos[:6] += base_pos[:6]
     pos[6] = np.clip(pos[6], 0.0, 1.0)
     vel = np.zeros(7)
-    vel[:6] = np.clip(
-        (pos[:6] - previous_pos[:6]) * control_hz,
-        -MAX_JOINT_VEL_RAD_S,
-        MAX_JOINT_VEL_RAD_S,
-    )
+    # Same controller as NEXT calibration and LEGO teleoperation: position PD, zero qdot target.
     return {"pos": pos, "vel": vel}
 
 
@@ -289,6 +285,7 @@ def control_loop(
     args: Args,
     stop: Any,
     buttons: Any,
+    next_estimator: Any = None,
 ) -> None:
     history = History(max(2 * model.horizon, model.past_steps))
     divisor = round(args.control_hz / args.inference_hz)
@@ -303,6 +300,7 @@ def control_loop(
     count = 0
     next_report_ns = started_ns
     next_action_report_ns = started_ns
+    held_next_target = None
     while not stop.is_set() and (args.max_steps is None or count < args.max_steps):
         if stop.wait(max(0.0, (clock.deadline_ns - time.monotonic_ns()) / 1e9)):
             break
@@ -324,26 +322,43 @@ def control_loop(
             segment_start = segment_target = segment_index = None
             last_action_ns = now_ns
             hold = state["joint_pos"].copy() if enabled else None
+            held_next_target = None
+            if next_estimator is not None:
+                next_estimator.reset()
             print("Yellow: policy enabled" if enabled else "Yellow: gravity-compensation idle", flush=True)
         if not enabled:
             robot.enter_gravity_comp_idle()
             robot.update()  # Clear PD targets before decoding/draining any queued camera frames.
             images.read(now_ns, required=False)
         else:
-            if segment_target is not None:
-                command = interpolate_command(
-                    segment_start, segment_target, (index - segment_index) / command_divisor
+            next_ready = True
+            if next_estimator is not None:
+                # Read before sending this tick's command; use the preceding held target.
+                previous_target = hold if held_next_target is None else held_next_target
+                estimate = next_estimator.update(
+                    state["joint_pos"],
+                    state["joint_vel"],
+                    previous_target,
+                    state["joint_eff_measured"],
+                    now_ns,
+                    state["joint_eff_gravity"],
                 )
+                next_ready = estimate is not None
+                state["joint_eff_external"] = state["joint_eff_external"].copy()
+                state["joint_eff_external"][:6] = estimate[1] if next_ready else 0.0
+            if segment_target is not None:
+                command = interpolate_command(segment_start, segment_target, (index - segment_index) / command_divisor)
             else:
                 command = {"pos": hold.copy(), "vel": np.zeros(7)}
             hold = command["pos"].copy()
             robot.command_joint_state(command)
             robot.update()
+            held_next_target = command["pos"].copy()
             if policy_tick:
                 frame_values = images.read(now_ns, required=True)
                 action = None
                 action_status = "camera unavailable"
-                if frame_values is not None:
+                if frame_values is not None and next_ready:
                     observations = projection.project(state)
                     observations.update(frame_values)
                     history.append(policy_index, observations)
@@ -364,6 +379,10 @@ def control_loop(
                         if temporal is not None:
                             action = model.decode(plan, temporal)
                             action_status = "decoded"
+                if not next_ready:
+                    action_status = "NEXT history warming up"
+                    history.rows.clear()
+                    planner.clear()
                 if action is None:
                     timeout = args.policy_timeout_s if active else args.startup_timeout_s
                     if now_ns - last_action_ns > timeout * 1e9:
@@ -424,10 +443,15 @@ def main(args: Args) -> None:
     if args.validate_only:
         return
     import torch
+
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import ArmType, GripperType
+    from i2rt.utils.next_torque import NextEstimator
 
     torch.set_num_threads(1)
+    next_path = args.next_checkpoint or REPO_ROOT / "data" / "next" / f"{args.side}.pt"
+    next_estimator = NextEstimator(next_path, args.command_hz, args.side)
+    print(f"NEXT torque: {next_path}; {args.command_hz} Hz; joint velocity target=0", flush=True)
     arm, gripper = ArmType.from_string_name(args.arm), GripperType.from_string_name(args.gripper)
     projection = JointStateProjection(args.side)
     images = planner = robot = buttons = None
@@ -448,6 +472,7 @@ def main(args: Args) -> None:
             args=args,
             stop=threading.Event(),
             buttons=buttons,
+            next_estimator=next_estimator,
         )
     except KeyboardInterrupt:
         pass

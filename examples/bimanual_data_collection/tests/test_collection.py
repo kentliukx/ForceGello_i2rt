@@ -135,6 +135,7 @@ class FakeRobot:
             "joint_pos": np.ones(n) * (0.1 if self.leader else 0.0),
             "joint_vel": np.zeros(n),
             "joint_eff_measured": np.ones(n) * 2,
+            "joint_eff_gravity": np.ones(n),
             "joint_eff_external": np.ones(n) * 2,
             "can_rx_monotonic_ns": np.full(n, time.monotonic_ns() - 1_000_000),
         }
@@ -182,7 +183,7 @@ def test_force_feedback_and_white_record_button_do_not_toggle_yellow_sync(monkey
     assert pair.mode == "following"
     assert packets.get_nowait()["kind"] == "toggle"
     source = np.ones(6) * (2 if mode == "torque" else 80 * 0.1)
-    expected = minimum_gello._leader_feedback_torque(source, np.zeros(6), np.ones(6) * 0.1, 0.05, 0.0, 1.0)
+    expected = minimum_gello._leader_feedback_torque(source, np.zeros(6), np.ones(6) * 0.1, 0.05, 0.0, 5.0)
     np.testing.assert_allclose(leader.torques[-1], expected)
     leader.buttons = [True, True]
     pair.read(packets)
@@ -276,8 +277,8 @@ def test_cartesian_projection_reconstructs_jacobian_effort_and_local_frame() -> 
 
 def test_fixed_camera_assignment_and_invalid_rates_are_rejected() -> None:
     assert validate(Args()) == {
-        "left_wrist": "realsense:135122075425",
-        "right_wrist": "realsense:135122079769",
+        "left_wrist": "realsense:135122079769",
+        "right_wrist": "realsense:135122075425",
         "external": "realsense:036422060422",
     }
     with pytest.raises(ValueError):
@@ -285,7 +286,7 @@ def test_fixed_camera_assignment_and_invalid_rates_are_rejected() -> None:
 
 
 @pytest.mark.parametrize("overrun", [False, True])
-def test_unified_loop_orders_both_followers_before_leaders_every_five_iterations(
+def test_unified_60hz_loop_orders_both_followers_before_leaders_every_iteration(
     monkeypatch: Any, overrun: bool
 ) -> None:
     from examples.bimanual_data_collection import collect_data
@@ -339,13 +340,13 @@ def test_unified_loop_orders_both_followers_before_leaders_every_five_iterations
     monkeypatch.setattr(collect_data.time, "monotonic_ns", lambda: now[0])
     monkeypatch.setattr(minimum_gello, "YAMLeaderRobot", FakeAdapter)
     monkeypatch.setattr(get_robot, "get_yam_robot", make_robot)
-    collect_data.control_worker(Args(alignment_s=0.001), packets, stop, now[0])
+    collect_data.control_worker(Args(alignment_s=0.001, feedback_mode="none"), packets, stop, now[0])
     for iteration in range(300):
-        expected = ["can_follower_l", "can_follower_r"] if iteration % 5 == 0 else []
+        expected = ["can_follower_l", "can_follower_r"]
         expected += ["can_leader_l", "can_leader_r"]
         assert [name for tick, name in updates if tick == iteration] == expected
     rows = [row for row in packets.queue if row["kind"] == "robot"]
-    assert len(rows) == 120  # 60 samples per pair for 300 executed iterations
+    assert len(rows) == 600
     assert all(robot.closed for robot in robots.values())
     for row in rows:
         assert row["follower_update_monotonic_ns"] <= row["leader_feedback_monotonic_ns"] <= row["monotonic_ns"]
@@ -355,8 +356,8 @@ def test_unified_loop_orders_both_followers_before_leaders_every_five_iterations
     if overrun:
         assert sum(row["missed_periods"] for row in left) > 0
     else:
-        assert [row["tick_index"] for row in left] == list(range(0, 300, 5))
-        assert left[-1]["monotonic_ns"] - left[0]["monotonic_ns"] == round(295e9 / 300)
+        assert [row["tick_index"] for row in left] == list(range(300))
+        assert left[-1]["monotonic_ns"] - left[0]["monotonic_ns"] == round(299e9 / 60)
 
 
 def test_camera_drains_acquisition_stream_and_keeps_one_frame_per_20hz_slot(monkeypatch: Any) -> None:

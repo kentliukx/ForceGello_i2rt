@@ -1,5 +1,10 @@
 # Bimanual Lead-Follower System Setup
 
+Default feedback is now **NEXT**. First record free-space motion and train the two estimators
+using [NEXT setup](../next/README.md). The default launcher shares the LEGO collector's controller:
+both follower position commands and leader force feedback run at **60 Hz**, and follower velocity
+targets are always zero. It loads `data/next/left.pt` and `data/next/right.pt` before opening hardware.
+
 For 60 Hz robot data, three 20 Hz cameras, and independent white-button trajectory recording,
 see [双臂数据采集](../bimanual_data_collection/README.md). Yellow-button teleoperation and force feedback are retained.
 
@@ -57,17 +62,19 @@ Once all CAN devices are properly configured and connected, launch the system:
 Assume you've installed the python virtual environment and run `source .venv/bin/activate`
 
 ```bash
-python examples/bimanual_lead_follower/bimanual_lead_follower.py --feedback-mode angle --bilateral-kp 0.05
+python examples/bimanual_lead_follower/bimanual_lead_follower.py --bilateral-kp 1
 ```
 
-Run this from the repository root. The flags are passed to both leader processes. `feedback_mode` defaults to `angle`, `bilateral_kp` defaults to `0.0`, `bilateral_alpha` defaults to `0.0` (no speed attenuation), and `bilateral_beta` defaults to `1.0`. Larger `beta` reduces the angle/torque feedback more strongly. All gains must be finite and non-negative. Start with a small `bilateral_kp`, check that each joint resists motion in the expected direction, and increase gradually if needed. `bilateral_kp=0` disables the leader's extra feedback torque.
+Run this from the repository root. Defaults: `feedback_mode=next`, `bilateral_kp=1`.
+NEXT feedback is `-bilateral_kp * (measured_torque - applied_gravity - predicted_free_residual)`.
+`bilateral_alpha` / `bilateral_beta` only affect the explicitly selected legacy angle/torque modes.
 
 ## Operation
 
 - **Press the top button on the teaching handle to enable the system**
-- This code essentially launches two `minimum_gello.py` instances for bimanual control
+- NEXT uses the same single control process as LEGO collection, without cameras.
 - Press the button once to synchronize each leader with its follower; press it again to disable synchronization and feedback. Repeat for the other handle.
-- On synchronization, the follower takes about 3 seconds to move from its current pose to the leader pose. During continuous following, the leader sends its measured joint angles (rad) and joint velocities (rad/s) from the same CAN-backed state update as the follower's position and velocity targets. The follower's motor PD controller uses both targets. The teaching-handle gripper has a zero target velocity. The initial 3-second alignment still sends position targets with zero target velocity. Joint targets are sent without angle smoothing; stale queued targets are discarded. Command arrivals wake the leader IO loop and the robot gravity-compensation loop; fresh CAN states also wake the robot loop. The motor position controller can still produce a tracking offset under load.
+- On synchronization, the follower takes about 3 seconds to move from its current pose to the leader pose. During following it receives measured leader joint angles in radians and zero velocity targets for all joints, at 60 Hz in NEXT mode. The motor PD controller can still produce a tracking offset under load.
 - `--feedback-mode angle` uses `follower_angle + 0.020 s * current_leader_velocity` as the leader's virtual target angle (radians). It forms a spring torque from `leader_base_kp * (leader_angle - virtual_target_angle)`, then reflects the opposite torque on the leader. The same compensated angle error drives the angle-correction factor below. The spring uses the same base joint gains as the earlier angle-tracking controller. The 20 ms prediction reduces the feedback caused by follower tracking delay during motion; it does not change the follower's position target.
 - `--feedback-mode torque` uses each follower motor's measured output-shaft torque minus its modeled gravity-compensation torque (both in Nm), retaining the follower's P and D response and other motor effects.
 - In both modes each joint's feedback is multiplied by `bilateral_kp / (1 + bilateral_alpha * abs(follower_joint_velocity)) * (2/pi) * atan((100 / bilateral_beta) * abs(angle_error))` when `bilateral_beta > 0`. In angle mode, `angle_error = leader_angle - (follower_angle + 0.020 s * current_leader_velocity)`; in torque mode it remains `leader_angle - follower_angle`. Velocity is in rad/s and angle is in radians; `bilateral_alpha` has units of s/rad, and `bilateral_beta` is dimensionless (100 is the angle sensitivity in 1/rad). `bilateral_alpha=0` disables speed attenuation; `bilateral_beta=0` disables angle attenuation entirely. For positive beta, the angle correction is zero when the relevant angle error is zero and approaches 1 as it grows. There is no low-pass filter or separate software cap on the feedback term. The motor driver still clamps the final MIT torque command to each motor's encoded range.

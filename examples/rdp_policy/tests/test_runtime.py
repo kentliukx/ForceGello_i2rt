@@ -53,9 +53,7 @@ def test_visual_latent_from_t_first_targets_the_command_at_t_plus_two() -> None:
     model.past_steps = 8
     model.slow_obs_latency_steps = 1
     model.joint_pos_key = "right_robot_joint_pos"
-    model.policy = SimpleNamespace(
-        predict_action=lambda *args, **kwargs: {"action": torch.zeros(1, 1, 4)}
-    )
+    model.policy = SimpleNamespace(predict_action=lambda *args, **kwargs: {"action": torch.zeros(1, 1, 4)})
     model.ratio = 4
     plan = model.infer(20, {"right_robot_joint_pos": np.full((2, 7), 0.4, dtype=np.float32)})
     assert plan.anchor_step == 20
@@ -77,7 +75,7 @@ def test_joint_commands_keep_position_and_velocity_units_and_gripper_convention(
     relative[6] = action[6]
     command = run.joint_command(relative, previous, previous, 20)
     np.testing.assert_allclose(command["pos"], action)
-    np.testing.assert_allclose(command["vel"][:6], np.full(6, 0.2))
+    np.testing.assert_array_equal(command["vel"], np.zeros(7))
     assert command["vel"][6] == 0
     action[6] = 2
     relative[6] = action[6]
@@ -94,7 +92,7 @@ def test_relative_arm_uses_fixed_slow_anchor_and_gripper_stays_absolute() -> Non
     command = run.joint_command(delta, base, previous_command, 20)
     np.testing.assert_allclose(command["pos"][:6], base[:6] + delta[:6])
     assert command["pos"][6] == pytest.approx(0.1)
-    np.testing.assert_allclose(command["vel"][:2], [1, -1])
+    np.testing.assert_array_equal(command["vel"], np.zeros(7))
     assert command["vel"][6] == 0
     # The next fast decode still uses this plan's original anchor, even when
     # the measured joints have moved in the meantime.
@@ -110,17 +108,15 @@ def test_joint_projection_passes_raw_residual_torque_without_jacobian() -> None:
         "joint_eff_external": np.array([0.3, -0.2, 0.1, 0, 0.7, -0.4, 9.0]),
     }
     projected = run.JointStateProjection("right").project(state)
-    np.testing.assert_allclose(
-        projected["right_robot_joint_effort_external"], state["joint_eff_external"][:6]
-    )
+    np.testing.assert_allclose(projected["right_robot_joint_effort_external"], state["joint_eff_external"][:6])
     assert "right_robot_tcp_wrench" not in projected
 
 
-def test_joint_command_clips_differenced_arm_velocity_per_joint() -> None:
+def test_joint_command_uses_zero_velocity_even_with_large_position_delta() -> None:
     action = np.array([0.2, -0.2, 0.1, -0.1, 0.05, -0.05, 0.7])
     command = run.joint_command(action, np.zeros(7), np.zeros(7), 20)
     np.testing.assert_allclose(command["pos"], action)
-    np.testing.assert_allclose(command["vel"], [1, -1, 1, -1, 1, -1, 0])
+    np.testing.assert_array_equal(command["vel"], np.zeros(7))
 
 
 def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(monkeypatch: Any) -> None:
@@ -166,11 +162,15 @@ def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(
             target = 10 * (temporal["right_robot_joint_effort_external"][-1, 0] + 1)
             return np.full(7, target - plan.base_joint_pos[0])
 
-    planner = SimpleNamespace(submit=lambda *args: None, latest=lambda: Plan(0, 0, np.zeros(1), np.zeros(7)), clear=lambda: None)
-    projection = SimpleNamespace(project=lambda state: {
-        "right_robot_joint_pos": state["joint_pos"],
-        "right_robot_joint_effort_external": state["joint_pos"][:6],
-    })
+    planner = SimpleNamespace(
+        submit=lambda *args: None, latest=lambda: Plan(0, 0, np.zeros(1), np.zeros(7)), clear=lambda: None
+    )
+    projection = SimpleNamespace(
+        project=lambda state: {
+            "right_robot_joint_pos": state["joint_pos"],
+            "right_robot_joint_effort_external": state["joint_pos"][:6],
+        }
+    )
     monkeypatch.setattr(run.time, "monotonic_ns", lambda: now[0])
     run.control_loop(
         Robot(),
@@ -183,12 +183,8 @@ def test_command_interpolation_reaches_each_target_on_the_next_20hz_observation(
         buttons=SimpleNamespace(consume_toggles=lambda since_ns: int(stop.step == 0)),
     )
     assert [step for step, _ in commands] == list(range(7))
-    np.testing.assert_allclose(
-        [command["pos"][0] for _, command in commands], [0, 0, 0, 0, 20 / 3, 40 / 3, 20]
-    )
-    np.testing.assert_allclose(
-        [command["vel"][0] for _, command in commands], [0, 0, 0, 0, 1, 1, 1]
-    )
+    np.testing.assert_allclose([command["pos"][0] for _, command in commands], [0, 0, 0, 0, 20 / 3, 40 / 3, 20])
+    np.testing.assert_allclose([command["vel"][0] for _, command in commands], [0, 0, 0, 0, 0, 0, 0])
     np.testing.assert_allclose(np.diff(submitted_ns) / 1e9, 1 / 60, atol=1e-8)
 
 
@@ -332,7 +328,7 @@ def test_control_loop_keeps_20hz_and_compensates_delayed_latent_with_current_for
         assert by_step[12]["pos"][0] == 0
         assert by_step[13]["pos"][0] == 0  # observation 13 is decoded, but not sent yet
         assert by_step[14]["pos"][0] == 11  # latent from step 10 keeps its step-10 anchor
-        assert by_step[14]["vel"][0] == 1
+        assert by_step[14]["vel"][0] == 0
         assert by_step[14]["vel"][6] == 0
     if 15 in presses:
         assert not any(step in by_step for step in range(15, 20))
@@ -413,7 +409,9 @@ def test_live_camera_rgb_preprocessing_and_stale_detection(monkeypatch: Any) -> 
     for rgb in obs.values():
         assert rgb.shape == (3, 24, 32) and rgb.dtype == np.float32
         assert rgb[0, 0, 0] > 0.98 and rgb[2, 0, 0] < 0.02
-    images.packets.put({"kind": "camera", "camera": "right_wrist", "jpeg": jpeg.tobytes(), "monotonic_ns": now + 50_000_000})
+    images.packets.put(
+        {"kind": "camera", "camera": "right_wrist", "jpeg": jpeg.tobytes(), "monotonic_ns": now + 50_000_000}
+    )
     assert images.read(now) is not None
     assert images.frames["right_wrist_img"][0] == now
     assert images.read(now + 50_000_000) is not None

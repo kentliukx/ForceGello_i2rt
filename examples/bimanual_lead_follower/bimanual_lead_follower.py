@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from contextlib import suppress
+from pathlib import Path
 from types import FrameType
 from typing import Literal
 
@@ -154,22 +155,43 @@ def _request_shutdown(_signum: int, _frame: FrameType | None) -> None:
 
 
 def main(
-    bilateral_kp: float = 0.0,
+    bilateral_kp: float = 1.0,
     bilateral_alpha: float = 0.0,
-    feedback_mode: Literal["angle", "torque"] = "angle",
+    feedback_mode: Literal["next", "none", "angle", "torque"] = "next",
     bilateral_beta: float = 1.0,
     trace_latency: bool = False,
     record_j3: bool = False,
+    next_left_checkpoint: Path = Path("data/next/left.pt"),
+    next_right_checkpoint: Path = Path("data/next/right.pt"),
 ) -> None:
-    """Launch both arm pairs with angle or torque feedback."""
+    """NEXT teleoperation uses the same 60 Hz controller as LEGO/NEXT collection."""
     if not math.isfinite(bilateral_kp) or bilateral_kp < 0.0:
         raise ValueError("--bilateral-kp must be a finite non-negative number")
     if not math.isfinite(bilateral_alpha) or bilateral_alpha < 0.0:
         raise ValueError("--bilateral-alpha must be a finite non-negative number")
     if not math.isfinite(bilateral_beta) or bilateral_beta < 0.0:
         raise ValueError("--bilateral-beta must be a finite non-negative number")
-    if feedback_mode not in ("angle", "torque"):
-        raise ValueError("--feedback-mode must be 'angle' or 'torque'")
+    if feedback_mode not in ("next", "none", "angle", "torque"):
+        raise ValueError("--feedback-mode must be next, none, angle or torque")
+    if feedback_mode in ("next", "none"):
+        sys.path.insert(0, repo_root)
+        from examples.bimanual_data_collection.collect_data import Args
+        from examples.bimanual_data_collection.collect_data import main as collect_main
+
+        if record_j3 or trace_latency:
+            raise ValueError(
+                "NEXT telemetry is recorded with the collector's right white button; omit legacy trace flags"
+            )
+        collect_main(
+            Args(
+                no_cameras=True,
+                feedback_mode=feedback_mode,
+                bilateral_kp=bilateral_kp,
+                next_left_checkpoint=next_left_checkpoint,
+                next_right_checkpoint=next_right_checkpoint,
+            )
+        )
+        return
 
     previous_sigterm = signal.signal(signal.SIGTERM, _request_shutdown)
     processes = []

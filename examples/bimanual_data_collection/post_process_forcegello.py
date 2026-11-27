@@ -48,12 +48,8 @@ class ArmKinematics:
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.data = mujoco.MjData(self.model)
         self.site = self.model.site("grasp_site").id
-        self.qpos_indices = [
-            self.model.joint(f"joint{i}").qposadr[0] for i in range(1, 7)
-        ]
-        self.dof_indices = [
-            self.model.joint(f"joint{i}").dofadr[0] for i in range(1, 7)
-        ]
+        self.qpos_indices = [self.model.joint(f"joint{i}").qposadr[0] for i in range(1, 7)]
+        self.dof_indices = [self.model.joint(f"joint{i}").dofadr[0] for i in range(1, 7)]
         self.damping, self.wrench_sign = damping, wrench_sign
         self.gripper_max_width_m = gripper_max_width_m
 
@@ -62,23 +58,14 @@ class ArmKinematics:
         dq = np.asarray(obs["joint_vel"], dtype=np.float64)
         measured = np.asarray(obs["joint_eff_measured"], dtype=np.float64)[:6]
         residual = np.asarray(obs["joint_eff_external"], dtype=np.float64)[:6]
-        if (
-            q.shape != (7,)
-            or dq.shape != (7,)
-            or measured.shape != (6,)
-            or residual.shape != (6,)
-        ):
-            raise ValueError(
-                "expected follower q/dq with 7 entries and arm effort with 6 entries"
-            )
+        if q.shape != (7,) or dq.shape != (7,) or measured.shape != (6,) or residual.shape != (6,):
+            raise ValueError("expected follower q/dq with 7 entries and arm effort with 6 entries")
         if not all(np.all(np.isfinite(value)) for value in (q, dq, measured, residual)):
             raise ValueError("non-finite follower state or effort")
         self.data.qpos[self.qpos_indices] = q[:6]
         mujoco.mj_forward(self.model, self.data)
         rotation = self.data.site_xmat[self.site].reshape(3, 3).copy()
-        pose = np.concatenate(
-            [self.data.site_xpos[self.site], rotation[:, :2].T.flatten()]
-        )
+        pose = np.concatenate([self.data.site_xpos[self.site], rotation[:, :2].T.flatten()])
         linear = np.zeros((3, self.model.nv))
         angular = np.zeros_like(linear)
         mujoco.mj_jacSite(self.model, self.data, linear, angular, self.site)
@@ -87,9 +74,7 @@ class ArmKinematics:
         wrench_base = self.wrench_sign * np.linalg.solve(
             jacobian @ jacobian.T + self.damping**2 * np.eye(6), jacobian @ residual
         )
-        wrench_tcp = np.concatenate(
-            [rotation.T @ wrench_base[:3], rotation.T @ wrench_base[3:]]
-        )
+        wrench_tcp = np.concatenate([rotation.T @ wrench_base[:3], rotation.T @ wrench_base[3:]])
         width = np.array([q[6] * self.gripper_max_width_m])
         values = {
             "tcp_pose": pose.astype(np.float32),
@@ -100,6 +85,7 @@ class ArmKinematics:
             "joint_vel": dq.astype(np.float32),
             "joint_effort": measured.astype(np.float32),
             "joint_effort_external": residual.astype(np.float32),
+            "joint_effort_external_valid": np.array([bool(obs.get("next_ready", True))]),
             "jacobian": jacobian.astype(np.float32),
         }
         return {f"{self.side}_robot_{key}": value for key, value in values.items()}
@@ -109,21 +95,13 @@ def leader_target(packet: dict[str, Any]) -> np.ndarray:
     """Pack the same pos7/vel7 layout used by the teleoperation follower command."""
     q = np.asarray(packet["leader_joint_pos_with_gripper"], dtype=np.float32)
     dq = np.asarray(packet["leader"]["joint_vel"], dtype=np.float32)
-    if (
-        q.shape != (7,)
-        or dq.shape != (6,)
-        or not np.all(np.isfinite(q))
-        or not np.all(np.isfinite(dq))
-    ):
-        raise ValueError(
-            "leader command requires finite q7 (arm + handle gripper) and six measured joint velocities"
-        )
-    return np.concatenate([q, dq, np.zeros(1, dtype=np.float32)])
+    if q.shape != (7,) or dq.shape != (6,) or not np.all(np.isfinite(q)) or not np.all(np.isfinite(dq)):
+        raise ValueError("leader command requires finite q7 (arm + handle gripper) and six measured joint velocities")
+    velocity_target = np.zeros(6, dtype=np.float32) if packet.get("follower_velocity_target") == "zero" else dq
+    return np.concatenate([q, velocity_target, np.zeros(1, dtype=np.float32)])
 
 
-def preceding_index(
-    timestamps: list[int], timestamp_ns: int, max_age_ns: int
-) -> int | None:
+def preceding_index(timestamps: list[int], timestamp_ns: int, max_age_ns: int) -> int | None:
     index = bisect.bisect_right(timestamps, timestamp_ns) - 1
     if index < 0 or timestamp_ns - timestamps[index] > max_age_ns:
         return None
@@ -139,17 +117,11 @@ def aligned_segments(
     camera_age_ns: int,
 ) -> Iterator[list[tuple[int, tuple[int, ...], tuple[int, ...]]]]:
     """Align both measured streams causally; keep missing-state gaps out of training chunks."""
-    robot_times = {
-        side: [int(row["monotonic_ns"]) for row in robots[side]] for side in SIDES
-    }
-    camera_times = {
-        name: [int(row["monotonic_ns"]) for row in cameras[name]] for name in CAMERAS
-    }
+    robot_times = {side: [int(row["monotonic_ns"]) for row in robots[side]] for side in SIDES}
+    camera_times = {name: [int(row["monotonic_ns"]) for row in cameras[name]] for name in CAMERAS}
     all_times = [*robot_times.values(), *camera_times.values()]
     if any(not values for values in all_times):
-        raise ValueError(
-            "each episode needs both robot streams and all three RGB streams"
-        )
+        raise ValueError("each episode needs both robot streams and all three RGB streams")
     origin = int(metadata["start_monotonic_ns"])
     start = max(*(values[0] for values in all_times), origin)
     end = min(
@@ -162,23 +134,21 @@ def aligned_segments(
         timestamp_ns = origin + round(tick * 1e9 / hz)
         if timestamp_ns >= end:
             break
-        indices = tuple(
-            preceding_index(robot_times[side], timestamp_ns, robot_age_ns)
-            for side in SIDES
+        indices = tuple(preceding_index(robot_times[side], timestamp_ns, robot_age_ns) for side in SIDES)
+        frames = tuple(preceding_index(camera_times[name], timestamp_ns, camera_age_ns) for name in CAMERAS)
+        next_unavailable = any(
+            index is not None
+            and metadata.get("control_timing", {}).get("effort_external_source") == "next"
+            and not robots[side][index].get("next_ready", False)
+            and robots[side][index].get("teleoperation_mode") != "idle"
+            for side, index in zip(SIDES, indices, strict=True)
         )
-        frames = tuple(
-            preceding_index(camera_times[name], timestamp_ns, camera_age_ns)
-            for name in CAMERAS
-        )
-        if any(index is None for index in (*indices, *frames)):
+        if any(index is None for index in (*indices, *frames)) or next_unavailable:
             if len(segment) >= 2:
                 yield segment
             segment = []
         else:
-            if segment and any(
-                index != previous + 1
-                for index, previous in zip(indices, segment[-1][1])
-            ):
+            if segment and any(index != previous + 1 for index, previous in zip(indices, segment[-1][1], strict=True)):
                 # Keep each segment on a continuous robot sample sequence.
                 if len(segment) >= 2:
                     yield segment
@@ -218,9 +188,7 @@ class ReplayWriter:
         self.ends.append(np.array([self.count], dtype=np.int64))
 
 
-def load_model(
-    metadata: dict[str, Any], i2rt_root: Path, robot_xml: Path | None
-) -> Path:
+def load_model(metadata: dict[str, Any], i2rt_root: Path, robot_xml: Path | None) -> Path:
     if robot_xml is not None:
         return robot_xml
     # Only compose the model. No robot is constructed and no CAN interface is opened.
@@ -253,12 +221,9 @@ def main(
 ) -> None:
     """Export same-timestamp dual-arm observations and leader joint commands."""
     if not all(
-        math.isfinite(x) and x > 0
-        for x in (hz, damping, gripper_max_width_m, max_robot_age_s, max_camera_age_s)
+        math.isfinite(x) and x > 0 for x in (hz, damping, gripper_max_width_m, max_robot_age_s, max_camera_age_s)
     ):
-        raise ValueError(
-            "rate, damping, gripper stroke and maximum sample ages must be finite and positive"
-        )
+        raise ValueError("rate, damping, gripper stroke and maximum sample ages must be finite and positive")
     if wrench_sign not in (-1.0, 1.0) or min(image_width, image_height, batch_size) < 1:
         raise ValueError("invalid wrench sign, image dimensions or batch size")
     if (output_dir / "replay_buffer.zarr").exists():
@@ -305,7 +270,7 @@ def main(
             "velocity": "each arm base frame; [vx,vy,vz,wx,wy,wz], m/s and rad/s",
             "wrench": "local grasp_site frame; [Fx,Fy,Fz,Tx,Ty,Tz], N and Nm; actuator-residual estimate",
             "wrench_equation": "F_base = sign * solve(J J^T + damping^2 I, J tau_residual); rotate force and moment into TCP",
-            "effort_residual": "recorded measured arm effort minus last submitted gravity term; includes friction/dynamics/tracking",
+            "effort_residual": "recorded joint_eff_external; source per episode: NEXT or legacy gravity residual",
             "jacobian": "base-frame grasp_site geometric Jacobian; rows [linear,angular], columns joint1..joint6",
             "gripper": "normalized measured opening * gripper_max_width_m; nominal conversion",
             "gripper_max_width_m": gripper_max_width_m,
@@ -318,9 +283,7 @@ def main(
     )
     sources = []
     for episode, metadata in episodes:
-        robots = {
-            side: read_robot_stream(episode / f"robot_{side}.pkl") for side in SIDES
-        }
+        robots = {side: read_robot_stream(episode / f"robot_{side}.pkl") for side in SIDES}
         cameras: dict[str, list[dict[str, Any]]] = {name: [] for name in CAMERAS}
         for line in (episode / "cameras.jsonl").read_text().splitlines():
             row = json.loads(line)
@@ -329,10 +292,7 @@ def main(
         for rows in cameras.values():
             rows.sort(key=lambda row: row["monotonic_ns"])
         xml = load_model(metadata, i2rt_root, robot_xml)
-        kinematics = {
-            side: ArmKinematics(xml, damping, wrench_sign, gripper_max_width_m, side)
-            for side in SIDES
-        }
+        kinematics = {side: ArmKinematics(xml, damping, wrench_sign, gripper_max_width_m, side) for side in SIDES}
         image_cache = {}
         for segment in aligned_segments(
             robots,
@@ -345,32 +305,31 @@ def main(
             pending = []
             for timestamp_ns, indices, frame_indices in segment:
                 row = {}
-                for side, index in zip(SIDES, indices):
+                for side, index in zip(SIDES, indices, strict=True):
                     packet = robots[side][index]
                     row.update(kinematics[side].project(packet["follower"]))
                     command = leader_target(packet)
                     row[f"{side}_leader_joint_pos"] = command[:7].copy()
-                    row[f"{side}_leader_joint_vel"] = command[7:].copy()
+                    row[f"{side}_leader_joint_vel"] = np.concatenate(
+                        [
+                            np.asarray(packet["leader"]["joint_vel"], dtype=np.float32)[:6],
+                            np.zeros(1, dtype=np.float32),
+                        ]
+                    )
                     row[f"{side}_robot_command"] = command
-                row["command"] = np.concatenate(
-                    [row[f"{side}_robot_command"] for side in SIDES]
-                )
+                row["command"] = np.concatenate([row[f"{side}_robot_command"] for side in SIDES])
                 robot = robots["right"][indices[1]]
                 row["monotonic_ns"] = np.asarray(timestamp_ns, dtype=np.int64)
                 row["timestamp"] = np.asarray(
-                    (robot["timestamp_ns"] + timestamp_ns - robot["monotonic_ns"])
-                    / 1e9,
+                    (robot["timestamp_ns"] + timestamp_ns - robot["monotonic_ns"]) / 1e9,
                     dtype=np.float64,
                 )
                 row["robot_source_monotonic_ns"] = np.asarray(
-                    [
-                        robots[side][index]["monotonic_ns"]
-                        for side, index in zip(SIDES, indices)
-                    ],
+                    [robots[side][index]["monotonic_ns"] for side, index in zip(SIDES, indices, strict=True)],
                     dtype=np.int64,
                 )
                 source_times = []
-                for name, key, frame_index in zip(CAMERAS, IMAGE_KEYS, frame_indices):
+                for name, key, frame_index in zip(CAMERAS, IMAGE_KEYS, frame_indices, strict=True):
                     frame = cameras[name][frame_index]
                     source_times.append(frame["monotonic_ns"])
                     path = (episode / frame["path"]).resolve()
@@ -386,9 +345,7 @@ def main(
                         )
                         image_cache[name] = (path, image)
                     row[key] = image_cache[name][1]
-                row["camera_source_monotonic_ns"] = np.asarray(
-                    source_times, dtype=np.int64
-                )
+                row["camera_source_monotonic_ns"] = np.asarray(source_times, dtype=np.int64)
                 pending.append(row)
                 if len(pending) == batch_size:
                     writer.append(pending)
@@ -402,19 +359,16 @@ def main(
                     "start_monotonic_ns": segment[0][0],
                     "end_monotonic_ns": segment[-1][0],
                     "settings": metadata["settings"],
+                    "control_timing": metadata.get("control_timing", {}),
                 }
             )
         print(f"Processed {episode}: {writer.count} total samples", flush=True)
     if writer.count == 0:
-        raise ValueError(
-            "no segments contain at least two aligned samples; check clocks and sample ages"
-        )
+        raise ValueError("no segments contain at least two aligned samples; check clocks and sample ages")
     writer.root.attrs["sources"] = sources
     writer.root.attrs["episode_count"] = len(sources)
     partial.rename(output_dir / "replay_buffer.zarr")
-    print(
-        f"Saved {writer.count} samples / {len(sources)} segments to {output_dir / 'replay_buffer.zarr'}"
-    )
+    print(f"Saved {writer.count} samples / {len(sources)} segments to {output_dir / 'replay_buffer.zarr'}")
 
 
 if __name__ == "__main__":
